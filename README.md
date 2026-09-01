@@ -31,6 +31,17 @@ Values are written to ten significant figures, so a record saved here and read
 back is the same record — measured round-trip error on a 106,020-point capture
 is exactly zero.
 
+Tick **ILC header (time_us,voltage_V)** under the library buttons and both
+`Save CSV...` and `Save all...` write the other layout instead:
+`time_us,voltage_V` with `#` comment lines above it, which is what the EOM-ILC
+panel reads as a target or as a seed drive. It needs the sample rate box
+(500kHz for the 2 µs grid): the time column is index / rate, from 0, and a
+save with the box ticked and no rate set is refused with the reason rather
+than guessed. The default `index,value` file is refused by that panel on
+purpose — with no time axis it would read the index as seconds — so a record
+that is going back to the ILC goes out with the box ticked. The setting is
+remembered between launches.
+
 The reader is deliberately looser than the writer, because the files it gets
 pointed at were written by other things:
 

@@ -169,6 +169,30 @@ if not written:
 still = [n for n in app.library if n not in app.saved]
 if still:
     failures.append("still flagged unsaved after Save all: %r" % (still[:5],))
+# With the ILC header box ticked (and a rate set), Save all writes the
+# time_us,voltage_V layout with a # header - the file EOM-ILC reads.
+ilc_folder = tempfile.mkdtemp()
+step("ILC header save all", lambda: (app.ilc_header.set(True),
+                                     app.rate_text.set("500000"),
+                                     _save_all(ilc_folder)))
+ilc_written = sorted(os.listdir(ilc_folder))
+if not ilc_written:
+    failures.append("ILC-header save all wrote nothing")
+else:
+    with open(os.path.join(ilc_folder, ilc_written[0])) as handle:
+        head = [handle.readline() for _ in range(6)]
+    if not head[0].startswith("# "):
+        failures.append("ILC-header file does not start with a # comment")
+    if "time_us,voltage_V\n" not in head:
+        failures.append("ILC-header file has no time_us,voltage_V header line")
+    body = [line for line in head if line and line[0].isdigit()]
+    if body and not body[0].startswith("0.000000,"):
+        failures.append("ILC-header time axis does not start at 0: %r" % (body[0],))
+for entry in os.listdir(ilc_folder):
+    os.remove(os.path.join(ilc_folder, entry))
+os.rmdir(ilc_folder)
+step("ILC header off again", lambda: (app.ilc_header.set(False),
+                                      app.rate_text.set("")))
 step("modify in place makes it unsaved again",
      lambda: (app.mod_source.set(sorted(app.library)[0]),
               app.mod_replace.set(True), app.do_invert(),

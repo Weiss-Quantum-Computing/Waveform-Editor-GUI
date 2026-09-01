@@ -1145,6 +1145,41 @@ def write_csv(path, samples):
         handle.close()
 
 
+def write_time_csv(path, samples, rate, comment=None):
+    """`time_us,voltage_V` with a `#` header: the layout the EOM-ILC targets
+    and drives use, so a record edited here goes straight back to that
+    program as a target or as a seed drive. The default `index,value` save
+    is refused there by name -- it has no time axis, and a reader that
+    guessed one once read a 5501-point drive as 5500 points at 1 s each.
+
+    `rate` is the sample rate in Hz (the top-bar box); the time column is
+    index / rate from 0, in microseconds, six decimals like the files this
+    is meant to match. Ten significant figures on the values, as write_csv.
+    """
+    if not rate or rate <= 0:
+        raise ValueError("set the sample rate in the top bar first - the "
+                         "time column needs it (500kHz for the 2 us grid)")
+    step_us = 1e6 / rate
+    handle = open(path, "w")
+    try:
+        if comment:
+            for line in as_text(comment).splitlines():
+                handle.write("# " + line + "\n")
+        handle.write("# Waveform Editor: %d points at %.6g us (sample rate "
+                     "%.10g Hz), time_us from 0\n" % (len(samples), step_us, rate))
+        handle.write("time_us,voltage_V\n")
+        block = []
+        for index, value in enumerate(samples):
+            block.append("%.6f,%.10g" % (index * step_us, value))
+            if len(block) >= 8192:
+                handle.write("\n".join(block) + "\n")
+                block = []
+        if block:
+            handle.write("\n".join(block) + "\n")
+    finally:
+        handle.close()
+
+
 def safe_name(text):
     """Trim a typed name down to something legal in a filename."""
     out = "".join(["_" if c in BAD_NAME_CHARS else c
@@ -1572,6 +1607,10 @@ class App(object):
 
         self.folder = tk.StringVar(value=self.cfg.get("folder", ""))
         self.rate_text = tk.StringVar(value=self.cfg.get("rate", ""))
+        # Ticked, Save CSV / Save all write `time_us,voltage_V` with a `#`
+        # header (needs the sample rate) - the layout EOM-ILC reads as a
+        # target or a seed drive. Off, the plain index,value file.
+        self.ilc_header = tk.BooleanVar(value=bool(self.cfg.get("ilc_header", False)))
 
         self.build_ui()
         watch(self.rate_text, self.on_rate)
@@ -1579,8 +1618,13 @@ class App(object):
         root.geometry(self.cfg.get("geometry", "1010x730"))
         root.minsize(880, 620)
         self.log("%s - build waveforms, cut them up, save them as CSV." % APP_NAME)
-        self.log("Files are written as index,value with the index counting "
-                 "from 1 and no header.")
+        if self.ilc_header.get():
+            self.log("Files are written as time_us,voltage_V with a # header "
+                     "(ILC header ticked; needs the sample rate).")
+        else:
+            self.log("Files are written as index,value with the index counting "
+                     "from 1 and no header. Tick 'ILC header' for the "
+                     "time_us,voltage_V layout EOM-ILC reads.")
 
     # -- layout ------------------------------------------------------------
 
@@ -1652,6 +1696,12 @@ class App(object):
                        command=left_cmd).grid(row=index, column=0, pady=1)
             ttk.Button(buttons, text=right_text, width=14,
                        command=right_cmd).grid(row=index, column=1, pady=1, padx=(4, 0))
+        # Every save goes through write_one, so this one box switches both
+        # Save buttons to the layout EOM-ILC reads (time_us,voltage_V with a
+        # # header). It needs the sample rate: the time column is index/rate.
+        ttk.Checkbutton(buttons, text="ILC header (time_us,voltage_V)",
+                        variable=self.ilc_header).grid(
+            row=len(rows), column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     def build_preview(self, parent):
         frame = ttk.LabelFrame(parent, text="Preview")
@@ -1910,8 +1960,26 @@ class App(object):
         self.write_one(path, name)
 
     def write_one(self, path, name):
+        """One waveform to one file, in whichever layout the ILC header box
+        says: plain index,value, or time_us,voltage_V with a # header
+        (needs the sample rate - refused with the reason, not guessed)."""
+        ilc = bool(self.ilc_header.get())
+        rate = self.rate()
+        if ilc and rate <= 0:
+            self.log("Not saved: 'ILC header' is ticked but no sample rate is set.")
+            messagebox.showinfo(
+                "Sample rate needed",
+                "'ILC header' is ticked, so the file gets a time_us column, "
+                "and that needs the sample rate in the top bar (500kHz is "
+                "the 2 us grid the ILC targets and drives use). Set it, or "
+                "untick the box for the plain index,value file.")
+            return False
         try:
-            write_csv(path, self.library[name])
+            if ilc:
+                write_time_csv(path, self.library[name], rate,
+                               comment="%s: %s" % (name, self.origin.get(name, name)))
+            else:
+                write_csv(path, self.library[name])
         except Exception as exc:
             self.log("Could not write %s: %s" % (path, exc))
             messagebox.showerror("Cannot save", str(exc))
@@ -1919,8 +1987,13 @@ class App(object):
         self.folder.set(os.path.dirname(os.path.abspath(path)))
         self.saved.add(name)
         self.refresh_library()
-        self.log("Saved %s -> %s (%s points, index,value from 1)"
-                 % (name, path, fmt_count(len(self.library[name]))))
+        if ilc:
+            self.log("Saved %s -> %s (%s points, time_us,voltage_V at %.6g us, "
+                     "# header)" % (name, path, fmt_count(len(self.library[name])),
+                                    1e6 / rate))
+        else:
+            self.log("Saved %s -> %s (%s points, index,value from 1)"
+                     % (name, path, fmt_count(len(self.library[name]))))
         return True
 
     def do_save_all(self):
@@ -1942,17 +2015,33 @@ class App(object):
                     "Go ahead?" % (len(clashes), preview)):
                 return
         self.folder.set(os.path.normpath(folder))
+        ilc = bool(self.ilc_header.get())
+        rate = self.rate()
+        if ilc and rate <= 0:
+            self.log("Not saved: 'ILC header' is ticked but no sample rate is set.")
+            messagebox.showinfo(
+                "Sample rate needed",
+                "'ILC header' is ticked, so every file gets a time_us column, "
+                "and that needs the sample rate in the top bar (500kHz is "
+                "the 2 us grid). Set it, or untick the box.")
+            return
         written = 0
         for name in self.library:
             path = os.path.join(folder, safe_name(name) + ".csv")
             try:
-                write_csv(path, self.library[name])
+                if ilc:
+                    write_time_csv(path, self.library[name], rate,
+                                   comment="%s: %s" % (name, self.origin.get(name, name)))
+                else:
+                    write_csv(path, self.library[name])
                 self.saved.add(name)
                 written += 1
             except Exception as exc:
                 self.log("Could not write %s: %s" % (path, exc))
         self.refresh_library()
-        self.log("Saved %d waveform(s) to %s" % (written, folder))
+        self.log("Saved %d waveform(s) to %s (%s)"
+                 % (written, folder,
+                    "time_us,voltage_V, # header" if ilc else "index,value"))
 
     # -- library housekeeping ---------------------------------------------
 
@@ -2934,6 +3023,7 @@ class App(object):
             return
         self.cfg["folder"] = self.folder.get()
         self.cfg["rate"] = self.rate_text.get()
+        self.cfg["ilc_header"] = bool(self.ilc_header.get())
         try:
             self.cfg["geometry"] = self.root.geometry()
         except Exception:
@@ -3060,6 +3150,28 @@ def selftest():
         if worst > 1e-9:
             failures.append("round trip changed a value by %g" % (worst,))
         check("index column", columns[0][:3], [1.0, 2.0, 3.0])
+    finally:
+        os.remove(path)
+
+    # The time,value writer: header recognised, volts picked, time axis at
+    # index / rate, and a missing rate refused rather than guessed.
+    handle, path = tempfile.mkstemp(suffix=".csv")
+    os.close(handle)
+    try:
+        sample = build_waveform("Gaussian", 300, {})
+        write_time_csv(path, sample, 500000.0, comment="selftest\ntwo lines")
+        columns, names = read_table(path)
+        check("time csv header", names, ["time_us", "voltage_V"])
+        check("time csv column", value_column(columns, names), (1, False))
+        check("time csv axis", columns[0][:3], [0.0, 2.0, 4.0])
+        worst = max([abs(a - b) for a, b in zip(columns[1], sample)])
+        if worst > 1e-9:
+            failures.append("time csv changed a value by %g" % (worst,))
+        try:
+            write_time_csv(path, sample, 0.0)
+            failures.append("time csv without a rate should have been refused")
+        except ValueError:
+            pass
     finally:
         os.remove(path)
 
