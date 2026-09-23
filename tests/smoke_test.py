@@ -292,6 +292,54 @@ step("supertime endpoints in volts", lambda: (app.st_end.set("9.16V"), app.st_en
 step("supertime endpoints in units", lambda: (app.st_zero.set("0.05"), app.st_end.set("10.97"),
                                               app.st_endpoints()))
 
+# --- modify: zero a point ---------------------------------------------------
+step("modify zero first", lambda: (app.tabs.select(app.tab_frames["modify"]),
+                                   app.mod_source.set(app.list_names[0]), app.mod_replace.set(False),
+                                   app.mod_name.set("zeroed_first"), app.do_zero_point("first")))
+if "zeroed_first" not in app.library or abs(app.library["zeroed_first"][0]) > 1e-12:
+    failures.append("zero first point did not zero the first point")
+
+# --- series pair --------------------------------------------------------------
+# Two nested ILC-style drives written to disk, then the whole tab: read,
+# check, preview, four files, and the target builder.
+ts, so, si = W.nested_targets(2.0, 200, 600, 100, 800, 300, 200, 9.0, 8.0)
+outer = os.path.join(folder, "drive_SMOKE_outer.csv")
+inner = os.path.join(folder, "drive_SMOKE_inner.csv")
+for path, values, off in ((outer, so, 0.02), (inner, si, 0.08)):
+    with open(path, "w") as fh:
+        fh.write("# smoke series drive\ntime_us,voltage_V\n")
+        for tt, vv in zip(ts, values):
+            fh.write("%g,%.6f\n" % (tt, vv + off))
+step("tab series", lambda: app.tabs.select(app.tab_frames["series"]))
+step("series check", lambda: (app.se_file_a.set(outer), app.se_file_b.set(inner),
+                              app.se_guard.set("50"), app.se_check()))
+report = app.se_report.get("1.0", "end")
+if "series pair OK" not in report:
+    failures.append("nested drives did not pass the series check: %r" % (report,))
+step("series swapped", lambda: (app.se_file_a.set(inner), app.se_file_b.set(outer), app.se_check()))
+if "NOT OK" not in app.se_report.get("1.0", "end"):
+    failures.append("swapped drives passed the series check")
+step("series preview", lambda: (app.se_file_a.set(outer), app.se_file_b.set(inner), app.se_preview()))
+if "drive_SMOKE_outer" not in app.library:
+    failures.append("series preview did not add the outer drive")
+step("series write", lambda: (app.folder.set(folder), app.se_stem.set("SMOKESER"), app.se_write()))
+for which in ("outer_up", "outer_down", "inner_up", "inner_down"):
+    path = os.path.join(folder, "SMOKESER_%s.csv" % which)
+    if not os.path.exists(path):
+        failures.append("series write missed %s" % which)
+        continue
+    raw = open(path, "rb").read()
+    if not raw[:1].isdigit() or b"\r\n" not in raw or raw.endswith(b"\n"):
+        failures.append("%s is not a headerless CRLF Supertime file" % which)
+t_iu, v_iu = W.read_timed(os.path.join(folder, "SMOKESER_inner_up.csv"))
+if abs(v_iu[0]) > 1e-9:
+    failures.append("inner up ramp does not start at zero: %r" % (v_iu[0],))
+step("series build targets", lambda: (app.se_target["step"].set("2"), app.se_build()))
+if "series_outer_target" not in app.library or "series_inner_target" not in app.library:
+    failures.append("target builder did not add both targets")
+if not app.ilc_header.get():
+    failures.append("target builder did not tick the ILC header")
+
 # --- library column width ---------------------------------------------------
 long_name = "drive_P92PX1H_i15_up_with_a_long_name"
 step("long library name", lambda: app.add_wave(long_name, [0.0, 0.5, 1.0], "width test"))

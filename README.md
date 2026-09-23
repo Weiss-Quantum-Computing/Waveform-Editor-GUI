@@ -128,8 +128,11 @@ silently mean whichever the lookup tried first.
 ### Modify
 
 Scale and offset, normalise to ±1, stretch to 0..1, invert, reverse, resample
-to a point count, clip to a range. Every one of them makes a new waveform by
-default; tick *change it in place* to overwrite the source instead.
+to a point count, clip to a range, and *Zero the first / last point*, which
+subtracts that sample's value from every point (the resting offset of an ILC
+drive: first sample for a ramp up, last for a ramp down). Every one of them
+makes a new waveform by default; tick *change it in place* to overwrite the
+source instead.
 
 ### Values
 
@@ -171,6 +174,40 @@ Trek-EOM-ILC loop writes):
    chain is amplitude dependent.
 
 The drive file, table and endpoints are remembered between launches.
+
+### Series pair
+
+Two EOM drives that run one after the other instead of together. The outer
+EOM goes to 90° on its own, the inner one does its full swing while the outer
+holds, and the outer only comes back once the inner is home. An EOM's
+extinction dips at its own 45° point and the motion is most sensitive to
+polarisation errors at the 90° point of the total rotation; in parallel both
+EOMs sit at 45° exactly there, in series the total passes 90° with one EOM at
+90 and the other at 0.
+
+1. Pick the **outer** and **inner** drive files (ILC `time_us,voltage_V`).
+2. **Check the pair** prints, for each drive, when it rises (5 to 95 % of its
+   stroke), how long it sits at the top, and when it falls; the guard between
+   the outer settling and the inner starting, and between the inner returning
+   and the outer leaving; where the other EOM is at each drive's 45° point;
+   and which EOM is where when the total crosses 90°. Lines marked `!!` fail,
+   and the summary says OK or NOT OK. The canvas shows the total rotation in
+   degrees (90 per full stroke of either drive) with dashed lines at the
+   seven segment boundaries.
+3. **Drives to library** adds both drives to look at or modify.
+4. **Write** puts all four Supertime files in the Folder,
+   `<stem>_outer_up.csv`, `_outer_down`, `_inner_up`, `_inner_down`, each
+   drive split at the middle of its own plateau, under the offset, grid and
+   time-axis settings of the Supertime ramps tab.
+5. **Build targets** makes the two nested minimum-jerk targets for the ILC
+   to learn from a few times: lead, outer rise, guard, inner rise, inner
+   hold, tail (µs), the grid, and the two levels in volts. They land in the
+   library as `series_outer_target` and `series_inner_target` on a common
+   time axis, the sample rate is set to match the grid and the ILC header is
+   ticked, so *Save CSV* writes them as targets. The pair is run through the
+   same check as it is built.
+
+The files, guard and target numbers are remembered between launches.
 
 ## Sample rate
 

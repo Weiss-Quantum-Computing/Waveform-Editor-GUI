@@ -960,6 +960,193 @@ def write_supertime_csv(path, t, values):
         handle.close()
 
 
+def ramp_timing(t, values, low=0.05, high=0.95, flat=0.01):
+    """When a single up-hold-down drive moves, on its own time axis.
+
+    `rise` is the low->high crossing on the way up, `fall` the high->low
+    crossing on the way down (fractions of the stroke), `plateau` the first
+    and last samples within `flat` of the top. `index` holds the samples
+    behind each pair.
+    """
+    n = len(values)
+    if n < 3:
+        raise ValueError("too short to be a ramp")
+    base, top = min(values), max(values)
+    stroke = top - base
+    if stroke <= 0:
+        raise ValueError("a flat record has no ramp in it")
+
+    def first_above(level):
+        for i in range(n):
+            if values[i] >= level:
+                return i
+        return n - 1
+
+    def last_above(level):
+        for i in range(n - 1, -1, -1):
+            if values[i] >= level:
+                return i
+        return 0
+
+    i_rs, i_re = first_above(base + low * stroke), first_above(base + high * stroke)
+    i_fs, i_fe = last_above(base + high * stroke), last_above(base + low * stroke)
+    i_ps, i_pe = first_above(top - flat * stroke), last_above(top - flat * stroke)
+    return {"stroke": stroke, "base": base, "top": top,
+            "rise": (t[i_rs], t[i_re]), "plateau": (t[i_ps], t[i_pe]),
+            "fall": (t[i_fs], t[i_fe]),
+            "index": {"rise": (i_rs, i_re), "plateau": (i_ps, i_pe),
+                      "fall": (i_fs, i_fe)}}
+
+
+def interp_to(t_new, t_old, values):
+    """A timed record read off at other times, linearly; held flat past
+    either end of the old record."""
+    out = []
+    j = 0
+    m = len(t_old)
+    for x in t_new:
+        if x <= t_old[0]:
+            out.append(values[0])
+            continue
+        if x >= t_old[-1]:
+            out.append(values[-1])
+            continue
+        while j < m - 2 and t_old[j + 1] < x:
+            j += 1
+        t0, t1 = t_old[j], t_old[j + 1]
+        f = (x - t0) / (t1 - t0) if t1 > t0 else 0.0
+        out.append(values[j] + f * (values[j + 1] - values[j]))
+    return out
+
+
+def series_pair(t_a, v_a, t_b, v_b, guard_us=0.0):
+    """Two drives meant to run in series: the outer one (A) does its whole
+    swing first, the inner one (B) swings only while A sits at its top, and
+    A comes back only after B has.
+
+    The point of the arrangement: an EOM's extinction dips at its 45 degree
+    point, and the motion is most sensitive to polarisation errors at the
+    90 degree point of the total rotation. In parallel both EOMs sit at
+    45 degrees exactly when the total is 90. In series the total passes 90
+    with A at 90 and B at 0, both clean.
+
+    Returns (lines, ok, angle, marks): a report, whether the pair passes,
+    the total rotation in degrees on A's time axis (90 per full stroke of
+    either drive), and plot marks at the segment boundaries.
+    """
+    if len(t_b) != len(t_a) or any(abs(x - y) > 1e-6 for x, y in zip(t_a, t_b)):
+        v_b = interp_to(t_a, t_b, v_b)
+    a, b = ramp_timing(t_a, v_a), ramp_timing(t_a, v_b)
+    lines = []
+    ok = [True]
+
+    def bad(text):
+        ok[0] = False
+        lines.append("  !! " + text)
+
+    for name, r in (("outer", a), ("inner", b)):
+        lines.append("%-5s rise %6.0f..%6.0f us (%4.0f)  top %6.0f..%6.0f us (%4.0f)  "
+                     "fall %6.0f..%6.0f us (%4.0f)  stroke %.3f V"
+                     % (name, r["rise"][0], r["rise"][1], r["rise"][1] - r["rise"][0],
+                        r["plateau"][0], r["plateau"][1], r["plateau"][1] - r["plateau"][0],
+                        r["fall"][0], r["fall"][1], r["fall"][1] - r["fall"][0], r["stroke"]))
+    lead = b["rise"][0] - a["plateau"][0]
+    trail = a["plateau"][1] - b["fall"][1]
+    lines.append("inner starts %.0f us after the outer is at its top; outer leaves its "
+                 "top %.0f us after the inner is back (guard wanted %.0f us)"
+                 % (lead, trail, guard_us))
+    if lead < guard_us:
+        bad("inner starts too early: the outer is still settling")
+    if trail < guard_us:
+        bad("outer comes down too early: the inner is still settling")
+    fa = [(x - a["base"]) / a["stroke"] for x in v_a]
+    fb = [(x - b["base"]) / b["stroke"] for x in v_b]
+    angle = [90.0 * (p + q) for p, q in zip(fa, fb)]
+
+    def crossing(fracs, level, rising):
+        if rising:
+            for i in range(len(fracs)):
+                if fracs[i] >= level:
+                    return i
+        else:
+            for i in range(len(fracs) - 1, -1, -1):
+                if fracs[i] >= level:
+                    return i
+        return None
+
+    for name, own, other in (("outer", fa, fb), ("inner", fb, fa)):
+        for rising, word in ((True, "up"), (False, "down")):
+            i = crossing(own, 0.5, rising)
+            if i is None:
+                continue
+            lines.append("%s at 45 deg on the way %s, %.0f us: other EOM at %.1f deg, "
+                         "total %.0f deg" % (name, word, t_a[i], 90.0 * other[i], angle[i]))
+            if abs(angle[i] - 90.0) < 10.0:
+                bad("that 45 deg extinction dip lands on the 90 deg point")
+    for rising, word in ((True, "up"), (False, "down")):
+        i = crossing([x / 90.0 for x in angle], 1.0, rising)
+        if i is None:
+            continue
+        lines.append("total 90 deg on the way %s at %.0f us: outer %.1f deg, inner %.1f deg"
+                     % (word, t_a[i], 90.0 * fa[i], 90.0 * fb[i]))
+        if min(abs(fa[i] - 0.5), abs(fb[i] - 0.5)) < 0.1:
+            bad("an EOM is near 45 deg at the total 90 deg point")
+    lines.append("series pair OK" if ok[0] else "series pair NOT OK")
+    ia, ib = a["index"], b["index"]
+    starts = [(0, "outer up"), (ia["rise"][1], "outer top"), (ib["rise"][0], "inner up"),
+              (ib["rise"][1], "inner top"), (ib["fall"][0], "inner down"),
+              (ib["fall"][1], "outer top"), (ia["fall"][0], "outer down")]
+    marks = []
+    for k, (start, label) in enumerate(starts):
+        nxt = starts[k + 1][0] if k + 1 < len(starts) else len(t_a)
+        marks.append((start, label, max(nxt - start, 0)))
+    return lines, ok[0], angle, marks
+
+
+def nested_targets(step_us, lead_us, outer_rise_us, guard_us, inner_rise_us,
+                   inner_hold_us, tail_us, outer_level=1.0, inner_level=1.0):
+    """Two minimum-jerk ILC targets for a series pair on one time grid.
+
+    The outer target rises, holds for guard + inner rise + inner hold +
+    inner rise + guard, and falls; the inner one rises `guard_us` after the
+    outer is up, holds, and is back down `guard_us` before the outer falls.
+    Returns (t_us, outer, inner).
+    """
+    if step_us <= 0:
+        raise ValueError("the grid step must be positive")
+    for name, value in (("lead", lead_us), ("outer rise", outer_rise_us),
+                        ("guard", guard_us), ("inner rise", inner_rise_us),
+                        ("inner hold", inner_hold_us), ("tail", tail_us)):
+        if value < 0:
+            raise ValueError("%s cannot be negative" % (name,))
+    outer_hold = 2.0 * guard_us + 2.0 * inner_rise_us + inner_hold_us
+    total = lead_us + 2.0 * outer_rise_us + outer_hold + tail_us
+    n = int(round(total / float(step_us))) + 1
+    t = [i * float(step_us) for i in range(n)]
+
+    def smooth(u):
+        return u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+
+    def envelope(t0, rise, hold, level):
+        out = []
+        for x in t:
+            if x < t0 or x >= t0 + 2.0 * rise + hold:
+                y = 0.0
+            elif x < t0 + rise:
+                y = smooth((x - t0) / rise) if rise > 0 else 1.0
+            elif x < t0 + rise + hold:
+                y = 1.0
+            else:
+                y = 1.0 - smooth((x - t0 - rise - hold) / rise) if rise > 0 else 0.0
+            out.append(level * y)
+        return out
+
+    outer = envelope(lead_us, outer_rise_us, outer_hold, outer_level)
+    inner = envelope(lead_us + outer_rise_us + guard_us, inner_rise_us,
+                     inner_hold_us, inner_level)
+    return t, outer, inner
+
+
 def read_eom_table(path):
     """[(card_volts, log_units), ...] from an EOM_X*.txt table, sorted by units.
 
@@ -2456,6 +2643,7 @@ class App(object):
                 ("assemble", "Assemble", self.tab_assemble),
                 ("modify", "Modify", self.tab_modify),
                 ("supertime", "Supertime ramps", self.tab_supertime),
+                ("series", "Series pair", self.tab_series),
                 ("values", "Values", self.tab_values)):
             frame = ttk.Frame(self.tabs)
             self.tabs.add(frame, text=title)
@@ -2505,7 +2693,7 @@ class App(object):
         bottom.pack(fill="x", padx=8, pady=(2, 8))
         ttk.Label(bottom, text="Name:").pack(side="left")
         self.build_name = tk.StringVar(value="gaussian")
-        ttk.Entry(bottom, textvariable=self.build_name, width=18).pack(
+        ttk.Entry(bottom, textvariable=self.build_name, width=30).pack(
             side="left", padx=(4, 6))
         ttk.Button(bottom, text="Build", command=self.do_build).pack(side="left")
         self.build_note = ttk.Label(bottom, text="", foreground=NOTE_GREY,
@@ -2622,7 +2810,7 @@ class App(object):
         top.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(top, text="Source:").pack(side="left")
         self.cut_source = tk.StringVar()
-        self.cut_box = ttk.Combobox(top, textvariable=self.cut_source, width=22,
+        self.cut_box = ttk.Combobox(top, textvariable=self.cut_source, width=36,
                                     state="readonly")
         self.cut_box.pack(side="left", padx=(4, 8))
         self.cut_box.bind("<<ComboboxSelected>>",
@@ -2642,7 +2830,7 @@ class App(object):
                                                                  padx=(4, 8))
         ttk.Label(row, text="Name:").pack(side="left", padx=(6, 0))
         self.cut_name = tk.StringVar()
-        ttk.Entry(row, textvariable=self.cut_name, width=16).pack(side="left",
+        ttk.Entry(row, textvariable=self.cut_name, width=30).pack(side="left",
                                                                   padx=(4, 6))
         ttk.Button(row, text="Take piece", command=self.do_take).pack(side="left")
         self.cut_note = ttk.Label(parent, text="", foreground=NOTE_GREY,
@@ -2857,7 +3045,7 @@ class App(object):
         bottom.pack(fill="x", padx=8, pady=(4, 8))
         ttk.Label(bottom, text="Name:").pack(side="left")
         self.seg_name = tk.StringVar(value="assembled")
-        ttk.Entry(bottom, textvariable=self.seg_name, width=18).pack(
+        ttk.Entry(bottom, textvariable=self.seg_name, width=30).pack(
             side="left", padx=(4, 6))
         ttk.Button(bottom, text="Build waveform",
                    command=self.do_assemble).pack(side="left")
@@ -3032,7 +3220,7 @@ class App(object):
         top.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(top, text="Waveform:").pack(side="left")
         self.mod_source = tk.StringVar()
-        self.mod_box = ttk.Combobox(top, textvariable=self.mod_source, width=22,
+        self.mod_box = ttk.Combobox(top, textvariable=self.mod_source, width=36,
                                     state="readonly")
         self.mod_box.pack(side="left", padx=(4, 12))
         self.mod_replace = tk.BooleanVar(value=False)
@@ -3040,7 +3228,7 @@ class App(object):
                         variable=self.mod_replace).pack(side="left")
         ttk.Label(top, text="Result name:").pack(side="left", padx=(12, 4))
         self.mod_name = tk.StringVar()
-        ttk.Entry(top, textvariable=self.mod_name, width=16).pack(side="left")
+        ttk.Entry(top, textvariable=self.mod_name, width=30).pack(side="left")
         ttk.Label(top, text="(blank names it after the source)",
                   foreground=NOTE_GREY).pack(side="left", padx=(4, 0))
 
@@ -3082,6 +3270,17 @@ class App(object):
         ttk.Entry(two, textvariable=self.mod_high, width=7).pack(side="left", padx=4)
         ttk.Button(two, text="Clip", command=self.do_clip).pack(side="left",
                                                                 padx=(6, 0))
+
+        three = ttk.Frame(parent)
+        three.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(three, text="Offset:").pack(side="left")
+        ttk.Button(three, text="Zero the first point",
+                   command=lambda: self.do_zero_point("first")).pack(side="left", padx=(6, 2))
+        ttk.Button(three, text="Zero the last point",
+                   command=lambda: self.do_zero_point("last")).pack(side="left", padx=2)
+        ttk.Label(three, text="(that sample's value is subtracted from every point: "
+                              "first for a ramp up, last for a ramp down)",
+                  foreground=NOTE_GREY).pack(side="left", padx=(4, 0))
         self.mod_note = ttk.Label(parent, text="", foreground=NOTE_GREY,
                                   wraplength=560, justify="left")
         self.mod_note.pack(anchor="w", padx=8, pady=(0, 6))
@@ -3125,6 +3324,16 @@ class App(object):
     def do_unipolar(self):
         self.modify("unipolar", "stretched to 0..1", unipolar)
 
+    def do_zero_point(self, anchor):
+        """Take the resting offset out of an ILC drive: the first (ramp up) or
+        last (ramp down) sample's level, subtracted from every sample."""
+        def run(samples):
+            values, offset = remove_offset(samples, anchor)
+            self.log("Offset: %s sample was %.6g, subtracted from all %s points"
+                     % (anchor, offset, fmt_count(len(samples))))
+            return values
+        self.modify("zeroed", "%s point zeroed" % (anchor,), run)
+
     def do_invert(self):
         self.modify("inv", "inverted", lambda y: scaled(y, -1.0, 0.0))
 
@@ -3157,7 +3366,7 @@ class App(object):
             side="left", padx=4)
         ttk.Label(top, text="Name:").pack(side="left", padx=(14, 4))
         self.values_name = tk.StringVar(value="typed")
-        ttk.Entry(top, textvariable=self.values_name, width=16).pack(side="left")
+        ttk.Entry(top, textvariable=self.values_name, width=30).pack(side="left")
         ttk.Button(top, text="Use these values",
                    command=self.do_values_use).pack(side="left", padx=6)
         self.values_note = ttk.Label(top, text="", foreground=NOTE_GREY)
@@ -3337,6 +3546,11 @@ class App(object):
         split = as_float(self.st_split.get(), -1.0)
         if split < 0:
             raise ValueError("the split time must be a number of microseconds")
+        return self.st_split_drive(t, v, split)
+
+    def st_split_drive(self, t, v, split):
+        """One drive into its two halves under the Supertime tab's offset,
+        grid and time-axis settings."""
         up, down = split_at_time(t, v, split)
         step = self.st_step.get().strip()
         out = []
@@ -3431,6 +3645,192 @@ class App(object):
         self.cfg["st_table"] = self.st_table.get()
         self.cfg["st_zero"] = self.st_zero.get()
         self.cfg["st_end"] = self.st_end.get()
+
+    def tab_series(self, parent):
+        """Two ILC drives that run one after the other on the two EOMs: check
+        that they nest, see the total rotation, write all four Supertime
+        files, and build nested targets for the ILC to learn."""
+        self.se_data = {}                                     # "a"/"b" -> (t, v)
+        for key, label in (("a", "Outer drive (moves first):"),
+                           ("b", "Inner drive (moves inside the outer's hold):")):
+            row = ttk.Frame(parent)
+            row.pack(fill="x", padx=8, pady=(8 if key == "a" else 2, 2))
+            ttk.Label(row, text=label, width=44).pack(side="left")
+            var = tk.StringVar(value=self.cfg.get("se_file_" + key, ""))
+            setattr(self, "se_file_" + key, var)
+            ttk.Entry(row, textvariable=var, width=46).pack(side="left", padx=4)
+            ttk.Button(row, text="Browse...",
+                       command=lambda k=key: self.se_browse(k)).pack(side="left")
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row, text="Guard").pack(side="left")
+        self.se_guard = tk.StringVar(value=self.cfg.get("se_guard", "200"))
+        ttk.Entry(row, textvariable=self.se_guard, width=7).pack(side="left", padx=4)
+        ttk.Label(row, text="us between one EOM settling and the other moving").pack(side="left")
+        ttk.Button(row, text="Check the pair", command=self.se_check).pack(side="left", padx=(12, 4))
+        ttk.Button(row, text="Drives to library", command=self.se_preview).pack(side="left")
+        ttk.Label(row, text="Write four files as").pack(side="left", padx=(14, 2))
+        self.se_stem = tk.StringVar()
+        ttk.Entry(row, textvariable=self.se_stem, width=18).pack(side="left", padx=2)
+        ttk.Label(row, text="_outer/_inner _up/_down.csv").pack(side="left")
+        ttk.Button(row, text="Write", command=self.se_write).pack(side="left", padx=(6, 0))
+
+        self.se_report = tk.Text(parent, height=9, width=110, font=MONO_FONT,
+                                 state="disabled", wrap="none")
+        self.se_report.pack(fill="x", padx=8, pady=(4, 2))
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(row, text="Nested targets for the ILC, us:").pack(side="left")
+        self.se_target = {}
+        for key, label, default in (("lead", "lead", "500"), ("orise", "outer rise", "1500"),
+                                    ("guard", "guard", "300"), ("irise", "inner rise", "2500"),
+                                    ("ihold", "inner hold", "1000"), ("tail", "tail", "500"),
+                                    ("step", "grid", "2")):
+            ttk.Label(row, text=label).pack(side="left", padx=(8, 2))
+            var = tk.StringVar(value=self.cfg.get("se_t_" + key, default))
+            self.se_target[key] = var
+            ttk.Entry(row, textvariable=var, width=6).pack(side="left")
+        ttk.Label(row, text="V outer").pack(side="left", padx=(8, 2))
+        self.se_level_a = tk.StringVar(value=self.cfg.get("se_level_a", "9.2"))
+        ttk.Entry(row, textvariable=self.se_level_a, width=6).pack(side="left")
+        ttk.Label(row, text="inner").pack(side="left", padx=(6, 2))
+        self.se_level_b = tk.StringVar(value=self.cfg.get("se_level_b", "8.5"))
+        ttk.Entry(row, textvariable=self.se_level_b, width=6).pack(side="left")
+        ttk.Button(row, text="Build targets", command=self.se_build).pack(side="left", padx=(10, 0))
+
+        self.se_note = ttk.Label(parent, text=(
+            "Series: the outer EOM goes to 90 deg on its own, then the inner one does its "
+            "full swing while the outer holds, and the outer only comes back once the inner "
+            "is home. The total rotation then passes 90 deg with one EOM at 90 and the other "
+            "at 0, so neither is at its 45 deg extinction dip on the sensitive point. Read "
+            "two drives and Check the pair to see the timings and the total angle; Build "
+            "targets makes the nested pair for the ILC to learn (saved with the ILC header)."),
+            foreground=NOTE_GREY, wraplength=760, justify="left")
+        self.se_note.pack(anchor="w", padx=8, pady=(2, 6))
+
+    def se_browse(self, key):
+        var = getattr(self, "se_file_" + key)
+        path = filedialog.askopenfilename(
+            initialdir=os.path.dirname(var.get()) or self.folder.get() or ".",
+            filetypes=(("waveform files", "*.csv *.txt"), ("all", "*.*")))
+        if path:
+            var.set(os.path.normpath(path))
+
+    def se_say(self, lines, warn=False):
+        self.se_report.configure(state="normal")
+        self.se_report.delete("1.0", "end")
+        self.se_report.insert("end", "\n".join(lines))
+        self.se_report.configure(state="disabled")
+        self.se_note.configure(foreground=NOTE_WARN if warn else NOTE_GREY)
+
+    def se_read(self):
+        """Both drives off disk; raises with a plain message if either fails."""
+        out = {}
+        for key in ("a", "b"):
+            path = getattr(self, "se_file_" + key).get().strip()
+            if not path:
+                raise ValueError("pick both drive files first")
+            out[key] = read_timed(path)
+            self.cfg["se_file_" + key] = path
+        self.se_data = out
+        if not self.se_stem.get().strip():
+            stem = os.path.splitext(os.path.basename(self.cfg["se_file_a"]))[0]
+            self.se_stem.set(stem.replace("drive_", ""))
+        return out
+
+    def se_check(self):
+        try:
+            data = self.se_read()
+            guard = as_float(self.se_guard.get(), 0.0)
+            (t_a, v_a), (t_b, v_b) = data["a"], data["b"]
+            lines, ok, angle, marks = series_pair(t_a, v_a, t_b, v_b, guard)
+        except Exception as exc:
+            self.se_say([str(exc)], warn=True)
+            return
+        self.cfg["se_guard"] = self.se_guard.get()
+        self.se_say(lines, warn=not ok)
+        for line in lines:
+            self.log("Series: " + line.strip())
+        self.show_trace(angle, "total rotation, degrees (outer + inner, 90 per stroke) - "
+                        "dashed lines at outer up/top, inner up/top/down, outer down",
+                        marks=marks, key=("series", self.cfg["se_file_a"], self.cfg["se_file_b"]))
+
+    def se_preview(self):
+        try:
+            data = self.se_read()
+        except Exception as exc:
+            self.se_say([str(exc)], warn=True)
+            return
+        for key, label in (("a", "outer"), ("b", "inner")):
+            t, v = data[key]
+            name = os.path.splitext(os.path.basename(self.cfg["se_file_" + key]))[0]
+            self.add_wave(name, v, "series %s drive, %g us grid" % (label, t[1] - t[0]))
+
+    def se_write(self):
+        """All four Supertime files, each drive split at the middle of its own
+        plateau, under the Supertime tab's offset and grid settings."""
+        try:
+            data = self.se_read()
+        except Exception as exc:
+            self.se_say([str(exc)], warn=True)
+            return
+        folder = self.folder.get().strip() or os.path.dirname(self.cfg["se_file_a"])
+        stem = safe_name(self.se_stem.get().strip() or "series")
+        written = []
+        for key, which in (("a", "outer"), ("b", "inner")):
+            t, v = data[key]
+            split = t[plateau_split(v)]
+            for label, anchor, tt, vv, offset in self.st_split_drive(t, v, split):
+                path = os.path.join(folder, "%s_%s_%s.csv" % (stem, which, label))
+                if os.path.exists(path) and not messagebox.askyesno(
+                        "Overwrite?", "%s exists. Replace it?" % (path,)):
+                    continue
+                write_supertime_csv(path, tt, vv)
+                written.append(os.path.basename(path))
+                self.log("Series: wrote %s - %s points, %g..%g us, split at %g us, "
+                         "%s sample was %.5g" % (os.path.basename(path), fmt_count(len(vv)),
+                                                 tt[0], tt[-1], split, anchor, offset))
+        self.se_say(["wrote " + (", ".join(written) or "nothing"),
+                     "offset rule and grid: as set on the Supertime ramps tab"])
+
+    def se_build(self):
+        try:
+            num = {}
+            for key, var in self.se_target.items():
+                value = as_float(var.get(), None)
+                if value is None:
+                    raise ValueError("every target time needs a number (us)")
+                num[key] = value
+            level_a = as_float(self.se_level_a.get(), 1.0)
+            level_b = as_float(self.se_level_b.get(), 1.0)
+            t, outer, inner = nested_targets(num["step"], num["lead"], num["orise"],
+                                             num["guard"], num["irise"], num["ihold"],
+                                             num["tail"], level_a, level_b)
+        except Exception as exc:
+            self.se_say([str(exc)], warn=True)
+            return
+        for key, var in self.se_target.items():
+            self.cfg["se_t_" + key] = var.get()
+        self.cfg["se_level_a"], self.cfg["se_level_b"] = self.se_level_a.get(), self.se_level_b.get()
+        rate = 1e6 / num["step"]
+        if abs(self.rate() - rate) > 1e-6:
+            self.rate_text.set("%g" % (rate,))
+            self.log("Sample rate set to %g Sa/s to match the %g us target grid." % (rate, num["step"]))
+        self.ilc_header.set(True)
+        self.add_wave("series_outer_target", outer,
+                      "nested target: lead %g, rise %g, guard %g, inner %g+%g+%g, tail %g us"
+                      % (num["lead"], num["orise"], num["guard"], num["irise"],
+                         num["ihold"], num["irise"], num["tail"]), select=False)
+        self.add_wave("series_inner_target", inner,
+                      "nested target inside series_outer_target", select=False)
+        lines, ok, angle, marks = series_pair(t, outer, t, inner, num["guard"] * 0.99)
+        self.se_say(["built series_outer_target and series_inner_target: %s points, "
+                     "%g us grid, %g us long, ILC header ticked for Save CSV"
+                     % (fmt_count(len(t)), num["step"], t[-1])] + lines, warn=not ok)
+        self.show_trace(angle, "total rotation of the nested targets, degrees",
+                        marks=marks, key=("series-targets", len(t)))
 
     def on_close(self):
         pending = [name for name in self.library if name not in self.saved]
@@ -3652,6 +4052,27 @@ def selftest():
             os.remove(p)
     except Exception as exc:
         failures.append("supertime files: %r" % (exc,))
+
+    try:
+        st, so, si = nested_targets(2.0, 100, 300, 50, 400, 200, 100, 9.0, 8.0)
+        check("nested length", len(st), int(round((100 + 300 + 50 + 400 + 200 + 400 + 50 + 300 + 100) / 2.0)) + 1)
+        close("outer level", max(so), 9.0)
+        close("inner level", max(si), 8.0)
+        close("outer ends at zero", so[-1], 0.0)
+        ra = ramp_timing(st, so)
+        close("outer rise ends", ra["rise"][1], 100 + 300 * 0.85, 12.0)   # 95% of a min-jerk ramp
+        close("outer top starts", ra["plateau"][0], 100 + 300 * 0.92, 12.0)  # within 1% of the top
+        lines, ok, angle, marks = series_pair(st, so, st, si, 40.0)
+        check("nested pair passes", ok, True)
+        close("total 180 deg", max(angle), 180.0)
+        check("seven segments", len(marks), 7)
+        # The same shape on both EOMs at once is the parallel case: both hit
+        # 45 deg on the 90 deg point, which the check must refuse.
+        lines, ok, angle, marks = series_pair(st, so, st, so, 0.0)
+        check("parallel pair refused", ok, False)
+        close("interp hold", interp_to([0.0, 1.0, 2.0], [0.0, 2.0], [0.0, 4.0])[1], 2.0)
+    except Exception as exc:
+        failures.append("series pair: %r" % (exc,))
 
     for line in failures:
         print("FAIL " + line)
