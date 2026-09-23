@@ -319,6 +319,13 @@ if "series pair OK" not in report:
 step("series swapped", lambda: (app.se_file_a.set(inner), app.se_file_b.set(outer), app.se_check()))
 if "NOT OK" not in app.se_report.get("1.0", "end"):
     failures.append("swapped drives passed the series check")
+step("series suggest guard", lambda: (app.se_file_a.set(outer), app.se_file_b.set(inner),
+                                      app.se_tol.set("0.2"), app.se_suggest()))
+if not app.se_guard.get().strip() or "guard suggested" not in app.se_report.get("1.0", "end"):
+    failures.append("guard suggestion did not fill the box: %r" % (app.se_guard.get(),))
+step("series check as parallel", lambda: app.se_parallel())
+if "NOT OK" not in app.se_report.get("1.0", "end"):
+    failures.append("nested drives passed the parallel check")
 step("series preview", lambda: (app.se_file_a.set(outer), app.se_file_b.set(inner), app.se_preview()))
 if "drive_SMOKE_outer" not in app.library:
     failures.append("series preview did not add the outer drive")

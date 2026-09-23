@@ -1103,6 +1103,100 @@ def series_pair(t_a, v_a, t_b, v_b, guard_us=0.0):
     return lines, ok[0], angle, marks
 
 
+def settle_times(t, values, tol=0.002):
+    """How long a learned drive takes to settle after each swing: from the
+    95 % point on the way up until it stays within `tol` of the stroke of its
+    resting top level, and from the 5 % point on the way down until it stays
+    within `tol` of its final level. Overshoot and ringing count as not yet
+    settled. Returns a dict with rise_settle, fall_settle (us) and the two
+    levels."""
+    r = ramp_timing(t, values)
+    band = tol * r["stroke"]
+    i_re, i_fs = r["index"]["rise"][1], r["index"]["fall"][0]
+    i_fe = r["index"]["fall"][1]
+    mid = (i_re + i_fs) // 2
+    top_level = sorted(values[i_re:i_fs + 1] or [r["top"]])[len(values[i_re:i_fs + 1]) // 2]
+    end_level = values[-1]
+
+    def last_outside(lo, hi, level):
+        for i in range(hi, lo - 1, -1):
+            if abs(values[i] - level) > band:
+                return i
+        return lo - 1
+
+    k = last_outside(i_re, mid, top_level)
+    rise_settle = t[min(k + 1, len(t) - 1)] - t[i_re] if k >= i_re else 0.0
+    k = last_outside(i_fe, len(values) - 1, end_level)
+    fall_settle = t[min(k + 1, len(t) - 1)] - t[i_fe] if k >= i_fe else 0.0
+    return {"rise_settle": rise_settle, "fall_settle": fall_settle,
+            "top_level": top_level, "end_level": end_level, "band": band}
+
+
+def suggest_guard(t_a, v_a, t_b, v_b, tol=0.002):
+    """The guard a series pair needs from the drives themselves: the outer's
+    settling into its top (before the inner may start) or the inner's
+    settling back home (before the outer may leave), whichever is longer,
+    rounded up to 10 us. Returns (guard_us, lines)."""
+    a, b = settle_times(t_a, v_a, tol), settle_times(t_b, v_b, tol)
+    need = max(a["rise_settle"], b["fall_settle"])
+    guard = 10.0 * int(need / 10.0 + 0.999) if need > 0 else 0.0
+    lines = ["outer settles within %.2g%% of its stroke %.0f us after the 95%% point "
+             "(top %.4f V); its return settles in %.0f us"
+             % (100 * tol, a["rise_settle"], a["top_level"], a["fall_settle"]),
+             "inner settles into its top in %.0f us; back within %.2g%% of home "
+             "%.0f us after the 5%% point" % (b["rise_settle"], 100 * tol, b["fall_settle"]),
+             "guard suggested: %.0f us (the longer of outer-up and inner-back settling)" % (guard,)]
+    return guard, lines
+
+
+def parallel_pair(t_a, v_a, t_b, v_b, tol_deg=3.0):
+    """Two drives meant to move together, one per EOM. In angle (90 per full
+    stroke of each) they should be the same curve; this reports how far
+    apart they get, in degrees and in time, and where the 90 degree point
+    is. Returns (lines, ok, diff_deg, marks)."""
+    if len(t_b) != len(t_a) or any(abs(x - y) > 1e-6 for x, y in zip(t_a, t_b)):
+        v_b = interp_to(t_a, t_b, v_b)
+    a, b = ramp_timing(t_a, v_a), ramp_timing(t_a, v_b)
+    fa = [(x - a["base"]) / a["stroke"] for x in v_a]
+    fb = [(x - b["base"]) / b["stroke"] for x in v_b]
+    diff = [90.0 * (p - q) for p, q in zip(fa, fb)]
+    total = [90.0 * (p + q) for p, q in zip(fa, fb)]
+    worst = max(range(len(diff)), key=lambda i: abs(diff[i]))
+    lines = ["strokes: A %.3f V, B %.3f V (B/A = %.3f); each counts 90 deg at its own full stroke"
+             % (a["stroke"], b["stroke"], b["stroke"] / a["stroke"]),
+             "A rise %.0f..%.0f us, B rise %.0f..%.0f us; A fall %.0f..%.0f us, B fall %.0f..%.0f us"
+             % (a["rise"] + b["rise"] + a["fall"] + b["fall"])]
+    ok = True
+    for word, ia, ib in (("up", a["index"]["rise"], b["index"]["rise"]),
+                         ("down", a["index"]["fall"], b["index"]["fall"])):
+        lag = t_a[ib[0]] - t_a[ia[0]]
+        lines.append("B lags A by %+.0f us at the start of the swing %s" % (lag, word))
+    lines.append("largest angle mismatch A-B: %+.1f deg at %.0f us (total %.0f deg there)"
+                 % (diff[worst], t_a[worst], total[worst]))
+    if abs(diff[worst]) > tol_deg:
+        ok = False
+        lines.append("  !! the two EOMs are more than %.1f deg apart" % (tol_deg,))
+    for rising, word in ((True, "up"), (False, "down")):
+        idx = None
+        rng = range(len(total)) if rising else range(len(total) - 1, -1, -1)
+        for i in rng:
+            if total[i] >= 90.0:
+                idx = i
+                break
+        if idx is not None:
+            lines.append("total 90 deg on the way %s at %.0f us: A %.1f deg, B %.1f deg"
+                         % (word, t_a[idx], 90 * fa[idx], 90 * fb[idx]))
+    lines.append("parallel pair OK" if ok else "parallel pair NOT OK")
+    ia, ib = a["index"], b["index"]
+    starts = [(0, "up"), (max(ia["rise"][1], ib["rise"][1]), "top"),
+              (min(ia["fall"][0], ib["fall"][0]), "down")]
+    marks = []
+    for k, (start, label) in enumerate(starts):
+        nxt = starts[k + 1][0] if k + 1 < len(starts) else len(t_a)
+        marks.append((start, label, max(nxt - start, 0)))
+    return lines, ok, diff, marks
+
+
 def nested_targets(step_us, lead_us, outer_rise_us, guard_us, inner_rise_us,
                    inner_hold_us, tail_us, outer_level=1.0, inner_level=1.0):
     """Two minimum-jerk ILC targets for a series pair on one time grid.
@@ -3669,8 +3763,20 @@ class App(object):
         ttk.Entry(row, textvariable=self.se_guard, width=7).pack(side="left", padx=4)
         ttk.Label(row, text="us between one EOM settling and the other moving").pack(side="left")
         ttk.Button(row, text="Check the pair", command=self.se_check).pack(side="left", padx=(12, 4))
+        ttk.Button(row, text="Check as parallel", command=self.se_parallel).pack(side="left", padx=(0, 4))
         ttk.Button(row, text="Drives to library", command=self.se_preview).pack(side="left")
-        ttk.Label(row, text="Write four files as").pack(side="left", padx=(14, 2))
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row, text="Settled within").pack(side="left")
+        self.se_tol = tk.StringVar(value=self.cfg.get("se_tol", "0.2"))
+        ttk.Entry(row, textvariable=self.se_tol, width=5).pack(side="left", padx=4)
+        ttk.Label(row, text="% of the stroke").pack(side="left")
+        ttk.Button(row, text="Suggest the guard from the drives",
+                   command=self.se_suggest).pack(side="left", padx=(8, 4))
+        ttk.Label(row, text="(outer settling into its top, or inner settling back home, "
+                            "whichever is longer)", foreground=NOTE_GREY).pack(side="left")
+        ttk.Label(row, text="Write four files as").pack(side="left", padx=(4, 2))
         self.se_stem = tk.StringVar()
         ttk.Entry(row, textvariable=self.se_stem, width=18).pack(side="left", padx=2)
         ttk.Label(row, text="_outer/_inner _up/_down.csv").pack(side="left")
@@ -3756,6 +3862,41 @@ class App(object):
         self.show_trace(angle, "total rotation, degrees (outer + inner, 90 per stroke) - "
                         "dashed lines at outer up/top, inner up/top/down, outer down",
                         marks=marks, key=("series", self.cfg["se_file_a"], self.cfg["se_file_b"]))
+
+    def se_suggest(self):
+        """Fill the guard box from the drives' own settling."""
+        try:
+            data = self.se_read()
+            tol = as_float(self.se_tol.get(), 0.2) / 100.0
+            if tol <= 0:
+                raise ValueError("the settle tolerance must be a positive percentage")
+            (t_a, v_a), (t_b, v_b) = data["a"], data["b"]
+            guard, lines = suggest_guard(t_a, v_a, t_b, v_b, tol)
+        except Exception as exc:
+            self.se_say([str(exc)], warn=True)
+            return
+        self.cfg["se_tol"] = self.se_tol.get()
+        self.se_guard.set("%g" % (guard,))
+        self.cfg["se_guard"] = self.se_guard.get()
+        self.se_say(lines)
+        for line in lines:
+            self.log("Series: " + line)
+
+    def se_parallel(self):
+        """The same two drives as a parallel pair: how far out of step."""
+        try:
+            data = self.se_read()
+            (t_a, v_a), (t_b, v_b) = data["a"], data["b"]
+            lines, ok, diff, marks = parallel_pair(t_a, v_a, t_b, v_b)
+        except Exception as exc:
+            self.se_say([str(exc)], warn=True)
+            return
+        self.se_say(lines, warn=not ok)
+        for line in lines:
+            self.log("Parallel: " + line.strip())
+        self.show_trace(diff, "angle mismatch A - B, degrees (90 per full stroke of each) - "
+                        "dashed lines at top and down", marks=marks,
+                        key=("parallel", self.cfg["se_file_a"], self.cfg["se_file_b"]))
 
     def se_preview(self):
         try:
@@ -4071,6 +4212,22 @@ def selftest():
         lines, ok, angle, marks = series_pair(st, so, st, so, 0.0)
         check("parallel pair refused", ok, False)
         close("interp hold", interp_to([0.0, 1.0, 2.0], [0.0, 2.0], [0.0, 4.0])[1], 2.0)
+        # A drive that overshoots and rings for 40 us after its 95 % point,
+        # and comes home cleanly: the guard must come from the ringing.
+        ring = list(so)
+        i95 = ra["index"]["rise"][1]
+        for k in range(i95, i95 + 20):
+            ring[k] = 9.0 + 0.1 * (1 if k % 2 else -1)
+        st_ = settle_times(st, ring)
+        close("rise settle", st_["rise_settle"], 40.0, 4.0)
+        close("fall settle clean", settle_times(st, so)["fall_settle"], 40.0, 12.0)  # 5% -> 0.2% of a min-jerk fall
+        guard, glines = suggest_guard(st, ring, st, si)
+        check("guard rounded up", guard >= 40.0 and guard % 10 == 0, True)
+        plines, pok, pdiff, pmarks = parallel_pair(st, so, st, [0.9 * x for x in so])
+        check("scaled copy is parallel", pok, True)
+        close("no mismatch for a scaled copy", max(abs(d) for d in pdiff), 0.0, 1e-6)
+        plines, pok, pdiff, pmarks = parallel_pair(st, so, st, si)
+        check("nested pair is not parallel", pok, False)
     except Exception as exc:
         failures.append("series pair: %r" % (exc,))
 

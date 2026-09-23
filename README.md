@@ -194,12 +194,22 @@ EOMs sit at 45° exactly there, in series the total passes 90° with one EOM at
    and the summary says OK or NOT OK. The canvas shows the total rotation in
    degrees (90 per full stroke of either drive) with dashed lines at the
    seven segment boundaries.
-3. **Drives to library** adds both drives to look at or modify.
-4. **Write** puts all four Supertime files in the Folder,
+3. **Suggest the guard from the drives** measures how long the outer takes to
+   settle into its top after its 95 % point, and the inner to settle back home
+   after its 5 % point, within the *Settled within* fraction of the stroke
+   (overshoot and ringing count as not settled), and puts the longer one,
+   rounded up to 10 µs, in the guard box.
+4. **Check as parallel** treats the same two drives as a pair that moves
+   together: it reports the lag between them at the start of each swing, the
+   largest angle mismatch (90° per full stroke of each, so unequal strokes do
+   not count as mismatch), and where both are when the total crosses 90°.
+   The canvas then shows the mismatch in degrees.
+5. **Drives to library** adds both drives to look at or modify.
+6. **Write** puts all four Supertime files in the Folder,
    `<stem>_outer_up.csv`, `_outer_down`, `_inner_up`, `_inner_down`, each
    drive split at the middle of its own plateau, under the offset, grid and
    time-axis settings of the Supertime ramps tab.
-5. **Build targets** makes the two nested minimum-jerk targets for the ILC
+7. **Build targets** makes the two nested minimum-jerk targets for the ILC
    to learn from a few times: lead, outer rise, guard, inner rise, inner
    hold, tail (µs), the grid, and the two levels in volts. They land in the
    library as `series_outer_target` and `series_inner_target` on a common
