@@ -292,6 +292,15 @@ step("supertime endpoints in volts", lambda: (app.st_end.set("9.16V"), app.st_en
 step("supertime endpoints in units", lambda: (app.st_zero.set("0.05"), app.st_end.set("10.97"),
                                               app.st_endpoints()))
 
+# --- library column width ---------------------------------------------------
+long_name = "drive_P92PX1H_i15_up_with_a_long_name"
+step("long library name", lambda: app.add_wave(long_name, [0.0, 0.5, 1.0], "width test"))
+shown = [app.listbox.get(i) for i in range(app.listbox.size())]
+if not any(long_name in s for s in shown):
+    failures.append("long name is clipped in the library: %r" % (shown,))
+if app.listbox.cget("width") < len(long_name) + 11:
+    failures.append("library column did not widen: %r" % (app.listbox.cget("width"),))
+
 # --- housekeeping ---------------------------------------------------------
 def _rename(new):
     app.ask_text = lambda *a, **k: new

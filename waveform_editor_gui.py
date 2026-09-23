@@ -116,6 +116,10 @@ BOUND_COLOUR = "#b0b0b0"          # segment boundaries in an assembled record
 # so on a bare XP install it silently falls back to something proportional and
 # the columns of numbers stop lining up.
 MONO_FONT = ("Courier New", 9)
+# The library column grows to fit the longest name, between these bounds
+# (characters); longer names are shortened with ".." rather than clipped.
+NAME_COLUMN_MIN = 17
+NAME_COLUMN_MAX = 44
 
 BAD_NAME_CHARS = r'<>:"/\|?*'
 
@@ -1857,7 +1861,7 @@ class App(object):
         box.rowconfigure(0, weight=1)
         # exportselection=0 or the highlight vanishes the moment the focus goes
         # to any entry box in the window, which on this panel is constantly.
-        self.listbox = tk.Listbox(box, width=30, height=10, exportselection=0,
+        self.listbox = tk.Listbox(box, width=NAME_COLUMN_MIN + 11, height=10, exportselection=0,
                                   font=MONO_FONT, activestyle="none")
         bar = ttk.Scrollbar(box, orient="vertical", command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=bar.set)
@@ -1973,10 +1977,16 @@ class App(object):
         keep = select or self.selected()
         self.listbox.delete(0, "end")
         self.list_names = list(self.library)
+        # Fit the name column to the longest name so nothing is clipped.
+        width = max([len(name) for name in self.list_names] + [NAME_COLUMN_MIN])
+        width = min(width, NAME_COLUMN_MAX)
+        self.listbox.configure(width=width + 11)
+        self.lib_note.configure(wraplength=max(210, 7 * (width + 11)))
         for name in self.list_names:
+            shown = name if len(name) <= width else name[:width - 2] + ".."
             # A star in the left margin is everything not written out yet.
-            self.listbox.insert("end", "%s%-17s %9s" % (
-                " " if name in self.saved else "*", name[:17],
+            self.listbox.insert("end", "%s%-*s %9s" % (
+                " " if name in self.saved else "*", width, shown,
                 fmt_count(len(self.library[name]))))
         if keep in self.library:
             index = self.list_names.index(keep)
