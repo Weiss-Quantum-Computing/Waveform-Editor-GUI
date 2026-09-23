@@ -2053,6 +2053,115 @@ SEG_DEFAULT.update({"repeat": "1", "scale": "1", "offset": "0", "gap": "0"})
 PREVIEW_MAX = 40000
 
 
+class FlowFrame(ttk.Frame):
+    """A row of widgets packed side="left" that wraps onto further lines when
+    the window is narrower than the row, instead of running off its right
+    edge - which on the lab PC's screen it did.
+
+    Children are packed as usual while the panel is built. The first time
+    the frame knows its width they are taken over and placed by hand, and
+    placed again whenever the width changes or a child changes size (a note
+    label whose text was just set). A pack padx/pady on the child is kept as
+    the gap around it.
+    """
+
+    def __init__(self, master, **kw):
+        ttk.Frame.__init__(self, master, **kw)
+        self._flow = None               # [(child, (left, right), (top, bottom))]
+        self._flow_width = None
+        self._flow_pending = None
+        self._flow_hidden = set()
+        self.bind("<Configure>", self._flow_configure)
+
+    def _flow_pad(self, value):
+        if isinstance(value, (tuple, list)):
+            parts = [int(float(x)) for x in value]
+        elif isinstance(value, int):
+            parts = [value]
+        else:
+            parts = [int(float(x)) for x in self.tk.splitlist(value)] or [0]
+        if len(parts) == 1:
+            parts = parts * 2
+        return parts[0], parts[1]
+
+    def _flow_take_over(self):
+        items = []
+        for child in self.winfo_children():
+            if child.winfo_manager() != "pack":
+                continue
+            info = child.pack_info()
+            items.append((child, self._flow_pad(info.get("padx", 0)),
+                          self._flow_pad(info.get("pady", 0))))
+        for child, _, _ in items:
+            child.pack_forget()
+            child.bind("<Configure>", self._flow_child_changed, add="+")
+        self._flow = items
+        self.pack_propagate(False)
+
+    def _flow_configure(self, event=None):
+        width = self.winfo_width()
+        if width <= 1:
+            return
+        if self._flow is None:
+            if not self.winfo_children():
+                return
+            self._flow_take_over()
+        elif width == self._flow_width:
+            return                      # our own height change coming back
+        self._flow_width = width
+        self._flow_place(width)
+
+    def _flow_child_changed(self, event=None):
+        if self._flow is None or self._flow_pending is not None:
+            return
+        self._flow_pending = self.after_idle(self._flow_later)
+
+    def _flow_later(self):
+        self._flow_pending = None
+        if self._flow_width:
+            self._flow_place(self._flow_width)
+
+    def _flow_place(self, width):
+        x = y = 0
+        line = 0
+        for child, (left, right), (top, bottom) in self._flow:
+            if child in self._flow_hidden:
+                continue
+            w, h = child.winfo_reqwidth(), child.winfo_reqheight()
+            need = left + w + right
+            if x > 0 and x + need > width:
+                y += line
+                x, line = 0, 0
+            child.place(x=x + left, y=y + top)
+            x += need
+            line = max(line, top + h + bottom)
+        self.configure(height=y + line)
+
+    def flow_show(self, child, shown=True):
+        """Take a child out of the row (shown=False) or put it back; the
+        rest close up around it. Works before and after the take-over."""
+        if shown:
+            self._flow_hidden.discard(child)
+        else:
+            self._flow_hidden.add(child)
+        if self._flow is None:
+            if shown and child.winfo_manager() == "":
+                child.pack(side="left")
+            elif not shown:
+                child.pack_forget()
+            return
+        if not shown:
+            child.place_forget()
+        if self._flow_width:
+            self._flow_place(self._flow_width)
+
+    def flow_lines(self):
+        """How many lines the children are on right now (for the tests)."""
+        if not self._flow:
+            return 1
+        return len(set(child.winfo_y() for child, _, _ in self._flow))
+
+
 class App(object):
 
     def __init__(self, root):
@@ -2734,18 +2843,39 @@ class App(object):
         self.tabs.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         self.tab_frames = OrderedDict()
         for key, title, builder in (
-                ("build", "Build a shape", self.tab_build),
-                ("cut", "Cut into pieces", self.tab_cut),
+                ("build", "Build", self.tab_build),
+                ("cut", "Cut", self.tab_cut),
                 ("assemble", "Assemble", self.tab_assemble),
                 ("modify", "Modify", self.tab_modify),
-                ("supertime", "Supertime ramps", self.tab_supertime),
-                ("series", "Series pair", self.tab_series),
+                ("supertime", "Supertime", self.tab_supertime),
+                ("series", "Series", self.tab_series),
                 ("values", "Values", self.tab_values)):
             frame = ttk.Frame(self.tabs)
             self.tabs.add(frame, text=title)
             self.tab_frames[key] = frame
             builder(frame)
         self.tabs.bind("<<NotebookTabChanged>>", lambda e: self.on_tab())
+        for frame in self.tab_frames.values():
+            frame.bind("<Configure>", self.wrap_notes, add="+")
+
+    def wrap_notes(self, event=None):
+        """Every note label sitting directly in a tab wraps at the tab's
+        width, so nothing runs off the right edge on a small screen. All
+        tabs are the same size, but only the one on show has a current
+        width, so that is the one measured."""
+        shown = [f for f in self.tab_frames.values() if f.winfo_ismapped()]
+        if not shown:
+            return
+        width = shown[0].winfo_width() - 20
+        if width < 200:
+            return
+        for frame in self.tab_frames.values():
+            for child in frame.winfo_children():
+                try:
+                    if int(child.cget("wraplength")) > 0:
+                        child.configure(wraplength=width)
+                except (tk.TclError, ValueError, TypeError):
+                    pass
 
     def on_tab(self):
         if self.active_tab() == "values" and not self.values_box.get("1.0", "end").strip():
@@ -2755,7 +2885,7 @@ class App(object):
     # -- tab: build a shape ------------------------------------------------
 
     def tab_build(self, parent):
-        top = ttk.Frame(parent)
+        top = FlowFrame(parent)
         top.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(top, text="Shape:").pack(side="left")
         self.shape = tk.StringVar(value="Gaussian")
@@ -2769,23 +2899,26 @@ class App(object):
         ttk.Label(top, text="points, or a time once a rate is set",
                   foreground=NOTE_GREY).pack(side="left", padx=(4, 0))
 
-        grid = ttk.Frame(parent)
+        grid = FlowFrame(parent)
         grid.pack(fill="x", padx=8, pady=2)
         self.shape_labels, self.shape_vars, self.shape_boxes = [], [], []
+        self.shape_grid, self.shape_pairs = grid, []
         for slot in xrange(BUILD_SLOTS):
-            row, col = divmod(slot, 3)
-            label = ttk.Label(grid, text="")
-            label.grid(row=row, column=col * 2, sticky="e", padx=(0, 4), pady=1)
+            # Each label+box pair is one unit, so a wrap never splits them.
+            pair = ttk.Frame(grid)
+            pair.pack(side="left", padx=(0, 14), pady=1)
+            self.shape_pairs.append(pair)
+            label = ttk.Label(pair, text="")
+            label.pack(side="left", padx=(0, 4))
             var = tk.StringVar()
-            widget = ttk.Combobox(grid, textvariable=var, width=14)
-            widget.grid(row=row, column=col * 2 + 1, sticky="w", padx=(0, 14),
-                        pady=1)
+            widget = ttk.Combobox(pair, textvariable=var, width=14)
+            widget.pack(side="left")
             watch(var, self.on_build_change)
             self.shape_labels.append(label)
             self.shape_vars.append(var)
             self.shape_boxes.append(widget)
 
-        bottom = ttk.Frame(parent)
+        bottom = FlowFrame(parent)
         bottom.pack(fill="x", padx=8, pady=(2, 8))
         ttk.Label(bottom, text="Name:").pack(side="left")
         self.build_name = tk.StringVar(value="gaussian")
@@ -2814,10 +2947,12 @@ class App(object):
                 widget.configure(values=list(choices) if choices else (),
                                  state="readonly" if choices else "normal")
                 var.set(default)
+                self.shape_grid.flow_show(self.shape_pairs[slot], True)
             else:
                 label.configure(text="")
                 widget.configure(values=(), state="disabled")
                 var.set("")
+                self.shape_grid.flow_show(self.shape_pairs[slot], False)
         self.build_name.set(safe_name(
             shape.split("(")[0].strip().replace(" ", "_").replace("-", "_").lower()))
         self.on_build_change()
@@ -2902,7 +3037,7 @@ class App(object):
     # -- tab: cut into pieces ---------------------------------------------
 
     def tab_cut(self, parent):
-        top = ttk.Frame(parent)
+        top = FlowFrame(parent)
         top.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(top, text="Source:").pack(side="left")
         self.cut_source = tk.StringVar()
@@ -2914,7 +3049,7 @@ class App(object):
         ttk.Label(top, text="Drag across the preview to pick a span; click it "
                             "to clear.", foreground=NOTE_GREY).pack(side="left")
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=2)
         ttk.Label(row, text="From:").pack(side="left")
         self.cut_first = tk.StringVar()
@@ -2924,9 +3059,11 @@ class App(object):
         self.cut_last = tk.StringVar()
         ttk.Entry(row, textvariable=self.cut_last, width=9).pack(side="left",
                                                                  padx=(4, 8))
-        ttk.Label(row, text="Name:").pack(side="left", padx=(6, 0))
+        unit = ttk.Frame(row)
+        unit.pack(side="left", padx=(6, 0))
+        ttk.Label(unit, text="Name:").pack(side="left")
         self.cut_name = tk.StringVar()
-        ttk.Entry(row, textvariable=self.cut_name, width=30).pack(side="left",
+        ttk.Entry(unit, textvariable=self.cut_name, width=30).pack(side="left",
                                                                   padx=(4, 6))
         ttk.Button(row, text="Take piece", command=self.do_take).pack(side="left")
         self.cut_note = ttk.Label(parent, text="", foreground=NOTE_GREY,
@@ -2935,35 +3072,29 @@ class App(object):
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=8, pady=4)
 
-        split = ttk.Frame(parent)
-        split.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Label(split, text="Split the whole source into").grid(
-            row=0, column=0, sticky="w")
+        split = FlowFrame(parent)
+        split.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(split, text="Split the whole source into").pack(side="left")
         self.cut_parts = tk.StringVar(value="4")
-        ttk.Entry(split, textvariable=self.cut_parts, width=6).grid(
-            row=0, column=1, padx=4)
-        ttk.Label(split, text="equal pieces").grid(row=0, column=2, sticky="w")
+        ttk.Entry(split, textvariable=self.cut_parts, width=6).pack(side="left", padx=4)
+        ttk.Label(split, text="equal pieces").pack(side="left")
         ttk.Button(split, text="Split", width=8,
-                   command=self.do_split_equal).grid(row=0, column=3, padx=(8, 0))
+                   command=self.do_split_equal).pack(side="left", padx=(8, 0))
 
-        ttk.Label(split, text="or into chunks of").grid(row=1, column=0,
-                                                        sticky="w", pady=(4, 0))
+        split = FlowFrame(parent)
+        split.pack(fill="x", padx=8, pady=(2, 2))
+        ttk.Label(split, text="or into chunks of").pack(side="left")
         self.cut_chunk = tk.StringVar(value="1000")
-        ttk.Entry(split, textvariable=self.cut_chunk, width=6).grid(
-            row=1, column=1, padx=4, pady=(4, 0))
-        ttk.Label(split, text="points each").grid(row=1, column=2, sticky="w",
-                                                  pady=(4, 0))
+        ttk.Entry(split, textvariable=self.cut_chunk, width=6).pack(side="left", padx=4)
+        ttk.Label(split, text="points each").pack(side="left")
         ttk.Button(split, text="Split", width=8,
-                   command=self.do_split_chunks).grid(row=1, column=3,
-                                                      padx=(8, 0), pady=(4, 0))
+                   command=self.do_split_chunks).pack(side="left", padx=(8, 0))
         self.cut_keep_short = tk.BooleanVar(value=True)
         ttk.Checkbutton(split, text="keep a short last chunk",
-                        variable=self.cut_keep_short).grid(row=1, column=4,
-                                                           sticky="w", padx=(10, 0),
-                                                           pady=(4, 0))
-        ttk.Label(split, text="Pieces are named after the source with _1, _2, "
-                             "... on the end.", foreground=NOTE_GREY).grid(
-            row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+                        variable=self.cut_keep_short).pack(side="left", padx=(10, 0))
+        ttk.Label(parent, text="Pieces are named after the source with _1, _2, "
+                             "... on the end.", foreground=NOTE_GREY, justify="left",
+                  wraplength=430).pack(anchor="w", padx=8, pady=(0, 8))
 
         for var in (self.cut_first, self.cut_last, self.cut_source):
             watch(var, self.on_cut_change)
@@ -3109,7 +3240,7 @@ class App(object):
     # -- tab: assemble -----------------------------------------------------
 
     def tab_assemble(self, parent):
-        top = ttk.Frame(parent)
+        top = FlowFrame(parent)
         top.pack(fill="x", padx=8, pady=(6, 2))
         ttk.Button(top, text="Add row", command=self.do_seg_add).pack(side="left")
         ttk.Button(top, text="Add the selected waveform",
@@ -3137,7 +3268,7 @@ class App(object):
         self.seg_body.bind("<Configure>", lambda e: self.seg_canvas.configure(
             scrollregion=self.seg_canvas.bbox("all")))
 
-        bottom = ttk.Frame(parent)
+        bottom = FlowFrame(parent)
         bottom.pack(fill="x", padx=8, pady=(4, 8))
         ttk.Label(bottom, text="Name:").pack(side="left")
         self.seg_name = tk.StringVar(value="assembled")
@@ -3312,7 +3443,7 @@ class App(object):
     # -- tab: modify -------------------------------------------------------
 
     def tab_modify(self, parent):
-        top = ttk.Frame(parent)
+        top = FlowFrame(parent)
         top.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(top, text="Waveform:").pack(side="left")
         self.mod_source = tk.StringVar()
@@ -3328,7 +3459,7 @@ class App(object):
         ttk.Label(top, text="(blank names it after the source)",
                   foreground=NOTE_GREY).pack(side="left", padx=(4, 0))
 
-        one = ttk.Frame(parent)
+        one = FlowFrame(parent)
         one.pack(fill="x", padx=8, pady=4)
         ttk.Label(one, text="Multiply by").pack(side="left")
         self.mod_scale = tk.StringVar(value="1")
@@ -3349,7 +3480,7 @@ class App(object):
         ttk.Button(one, text="Reverse", command=self.do_reverse).pack(side="left",
                                                                       padx=2)
 
-        two = ttk.Frame(parent)
+        two = FlowFrame(parent)
         two.pack(fill="x", padx=8, pady=(4, 8))
         ttk.Label(two, text="Resample to").pack(side="left")
         self.mod_points = tk.StringVar()
@@ -3367,15 +3498,14 @@ class App(object):
         ttk.Button(two, text="Clip", command=self.do_clip).pack(side="left",
                                                                 padx=(6, 0))
 
-        three = ttk.Frame(parent)
+        three = FlowFrame(parent)
         three.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Label(three, text="Offset:").pack(side="left")
         ttk.Button(three, text="Zero the first point",
                    command=lambda: self.do_zero_point("first")).pack(side="left", padx=(6, 2))
         ttk.Button(three, text="Zero the last point",
                    command=lambda: self.do_zero_point("last")).pack(side="left", padx=2)
-        ttk.Label(three, text="(that sample's value is subtracted from every point: "
-                              "first for a ramp up, last for a ramp down)",
+        ttk.Label(three, text="(that sample, subtracted from every point)",
                   foreground=NOTE_GREY).pack(side="left", padx=(4, 0))
         self.mod_note = ttk.Label(parent, text="", foreground=NOTE_GREY,
                                   wraplength=560, justify="left")
@@ -3453,7 +3583,7 @@ class App(object):
     # -- tab: values -------------------------------------------------------
 
     def tab_values(self, parent):
-        top = ttk.Frame(parent)
+        top = FlowFrame(parent)
         top.pack(fill="x", padx=8, pady=(6, 2))
         ttk.Button(top, text="Load the selected waveform",
                    command=self.do_values_load).pack(side="left")
@@ -3516,15 +3646,15 @@ class App(object):
     def tab_supertime(self, parent):
         """An ILC drive into the two shape files the sequence plays, and the
         start/end numbers to type into the edge."""
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=(8, 2))
         ttk.Label(row, text="Drive file:").pack(side="left")
         self.st_file = tk.StringVar(value=self.cfg.get("st_file", ""))
-        ttk.Entry(row, textvariable=self.st_file, width=46).pack(side="left", padx=4)
+        ttk.Entry(row, textvariable=self.st_file, width=36).pack(side="left", padx=4)
         ttk.Button(row, text="Browse...", command=self.st_browse).pack(side="left")
         ttk.Button(row, text="Read", command=self.st_read).pack(side="left", padx=4)
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=2)
         ttk.Label(row, text="Split at").pack(side="left")
         self.st_split = tk.StringVar()
@@ -3532,15 +3662,17 @@ class App(object):
         ttk.Label(row, text="us").pack(side="left")
         ttk.Button(row, text="Middle of the plateau",
                    command=self.st_find_plateau).pack(side="left", padx=(4, 14))
-        ttk.Label(row, text="Grid").pack(side="left")
+        unit = ttk.Frame(row)                  # kept together when the row wraps
+        unit.pack(side="left")
+        ttk.Label(unit, text="Grid").pack(side="left")
         self.st_step = tk.StringVar(value="")
-        ttk.Entry(row, textvariable=self.st_step, width=6).pack(side="left", padx=4)
-        ttk.Label(row, text="us (blank keeps the file's)").pack(side="left")
+        ttk.Entry(unit, textvariable=self.st_step, width=6).pack(side="left", padx=4)
+        ttk.Label(unit, text="us (blank keeps the file's)").pack(side="left")
         self.st_down_from_zero = tk.BooleanVar(value=False)
         ttk.Checkbutton(row, text="down ramp's time from 0",
                         variable=self.st_down_from_zero).pack(side="left", padx=(14, 0))
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=2)
         ttk.Label(row, text="Offset:").pack(side="left")
         self.st_offset_mode = tk.StringVar(value="subtract")
@@ -3551,7 +3683,7 @@ class App(object):
         ttk.Radiobutton(row, text="leave it",
                         variable=self.st_offset_mode, value="keep").pack(side="left", padx=4)
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=2)
         ttk.Label(row, text="Write as").pack(side="left")
         self.st_stem = tk.StringVar()
@@ -3560,19 +3692,21 @@ class App(object):
         ttk.Button(row, text="Write both files", command=self.st_write).pack(side="left", padx=(12, 4))
         ttk.Button(row, text="Preview in library", command=self.st_preview).pack(side="left")
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=(6, 2))
         ttk.Label(row, text="EOM table:").pack(side="left")
         self.st_table = tk.StringVar(value=self.cfg.get("st_table", ""))
         ttk.Entry(row, textvariable=self.st_table, width=34).pack(side="left", padx=4)
         ttk.Button(row, text="Browse...", command=self.st_browse_table).pack(side="left")
-        ttk.Label(row, text="start").pack(side="left", padx=(12, 2))
+        unit = ttk.Frame(row)
+        unit.pack(side="left", padx=(12, 0))
+        ttk.Label(unit, text="start").pack(side="left", padx=(0, 2))
         self.st_zero = tk.StringVar(value=self.cfg.get("st_zero", "0.012"))
-        ttk.Entry(row, textvariable=self.st_zero, width=7).pack(side="left")
-        ttk.Label(row, text="end").pack(side="left", padx=(8, 2))
+        ttk.Entry(unit, textvariable=self.st_zero, width=7).pack(side="left")
+        ttk.Label(unit, text="end").pack(side="left", padx=(8, 2))
         self.st_end = tk.StringVar(value=self.cfg.get("st_end", ""))
-        ttk.Entry(row, textvariable=self.st_end, width=7).pack(side="left")
-        ttk.Label(row, text="(coarse-channel log units, or volts with a V; the coarse zero is 0.012)").pack(side="left", padx=(4, 0))
+        ttk.Entry(unit, textvariable=self.st_end, width=7).pack(side="left")
+        ttk.Label(row, text="(coarse-channel units, or volts with a V)").pack(side="left", padx=(4, 0))
         ttk.Button(row, text="Endpoints", command=self.st_endpoints).pack(side="left", padx=(10, 0))
 
         self.st_note = ttk.Label(parent, text=(
@@ -3748,47 +3882,54 @@ class App(object):
         files, and build nested targets for the ILC to learn."""
         self.se_data = {}                                     # "a"/"b" -> (t, v)
         for key, label in (("a", "Outer drive (moves first):"),
-                           ("b", "Inner drive (moves inside the outer's hold):")):
-            row = ttk.Frame(parent)
+                           ("b", "Inner drive (moves during the outer's hold):")):
+            row = FlowFrame(parent)
             row.pack(fill="x", padx=8, pady=(8 if key == "a" else 2, 2))
-            ttk.Label(row, text=label, width=44).pack(side="left")
+            ttk.Label(row, text=label).pack(side="left")
             var = tk.StringVar(value=self.cfg.get("se_file_" + key, ""))
             setattr(self, "se_file_" + key, var)
-            ttk.Entry(row, textvariable=var, width=46).pack(side="left", padx=4)
+            ttk.Entry(row, textvariable=var, width=36).pack(side="left", padx=4)
             ttk.Button(row, text="Browse...",
                        command=lambda k=key: self.se_browse(k)).pack(side="left")
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=2)
-        ttk.Label(row, text="Guard").pack(side="left")
+        unit = ttk.Frame(row)
+        unit.pack(side="left")
+        ttk.Label(unit, text="Guard").pack(side="left")
         self.se_guard = tk.StringVar(value=self.cfg.get("se_guard", "200"))
-        ttk.Entry(row, textvariable=self.se_guard, width=7).pack(side="left", padx=4)
-        ttk.Label(row, text="us between one EOM settling and the other moving").pack(side="left")
+        ttk.Entry(unit, textvariable=self.se_guard, width=7).pack(side="left", padx=4)
+        ttk.Label(unit, text="us (one EOM settled before the other moves)").pack(side="left")
         ttk.Button(row, text="Check the pair", command=self.se_check).pack(side="left", padx=(12, 4))
         ttk.Button(row, text="Check as parallel", command=self.se_parallel).pack(side="left", padx=(0, 4))
         ttk.Button(row, text="Drives to library", command=self.se_preview).pack(side="left")
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=2)
-        ttk.Label(row, text="Settled within").pack(side="left")
+        unit = ttk.Frame(row)
+        unit.pack(side="left")
+        ttk.Label(unit, text="Settled within").pack(side="left")
         self.se_tol = tk.StringVar(value=self.cfg.get("se_tol", "0.2"))
-        ttk.Entry(row, textvariable=self.se_tol, width=5).pack(side="left", padx=4)
-        ttk.Label(row, text="% of the stroke").pack(side="left")
+        ttk.Entry(unit, textvariable=self.se_tol, width=5).pack(side="left", padx=4)
+        ttk.Label(unit, text="% of the stroke").pack(side="left")
         ttk.Button(row, text="Suggest the guard from the drives",
                    command=self.se_suggest).pack(side="left", padx=(8, 4))
-        ttk.Label(row, text="(outer settling into its top, or inner settling back home, "
-                            "whichever is longer)", foreground=NOTE_GREY).pack(side="left")
-        ttk.Label(row, text="Write four files as").pack(side="left", padx=(4, 2))
+        ttk.Label(row, text="(the longer of outer-up and inner-back settling)",
+                  foreground=NOTE_GREY).pack(side="left")
+
+        row = FlowFrame(parent)
+        row.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row, text="Write four files as").pack(side="left", padx=(0, 2))
         self.se_stem = tk.StringVar()
         ttk.Entry(row, textvariable=self.se_stem, width=18).pack(side="left", padx=2)
         ttk.Label(row, text="_outer/_inner _up/_down.csv").pack(side="left")
         ttk.Button(row, text="Write", command=self.se_write).pack(side="left", padx=(6, 0))
 
-        self.se_report = tk.Text(parent, height=9, width=110, font=MONO_FONT,
+        self.se_report = tk.Text(parent, height=6, width=40, font=MONO_FONT,
                                  state="disabled", wrap="none")
         self.se_report.pack(fill="x", padx=8, pady=(4, 2))
 
-        row = ttk.Frame(parent)
+        row = FlowFrame(parent)
         row.pack(fill="x", padx=8, pady=(6, 2))
         ttk.Label(row, text="Nested targets for the ILC, us:").pack(side="left")
         self.se_target = {}

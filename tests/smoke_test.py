@@ -347,6 +347,30 @@ if "series_outer_target" not in app.library or "series_inner_target" not in app.
 if not app.ilc_header.get():
     failures.append("target builder did not tick the ILC header")
 
+# --- nothing runs off the right edge at the minimum window size --------------
+def _overflow():
+    root.geometry("880x620")
+    root.update_idletasks()
+    root.update()
+    bad = []
+    for key, frame in app.tab_frames.items():
+        app.tabs.select(frame)
+        root.update_idletasks()
+        root.update()
+        for row in frame.winfo_children():
+            width = row.winfo_width()
+            if isinstance(row, W.FlowFrame):
+                for child, _, _ in row._flow or []:
+                    if child.winfo_x() + child.winfo_reqwidth() > width + 1:
+                        bad.append("%s: %s past the edge" % (key, child.winfo_class()))
+            elif row.winfo_reqwidth() > width + 1:
+                bad.append("%s: %s wants %d px of %d" % (key, row.winfo_class(),
+                                                        row.winfo_reqwidth(), width))
+    return bad
+step("minimum window size", lambda: None)
+for line in _overflow():
+    failures.append(line)
+
 # --- library column width ---------------------------------------------------
 long_name = "drive_P92PX1H_i15_up_with_a_long_name"
 step("long library name", lambda: app.add_wave(long_name, [0.0, 0.5, 1.0], "width test"))
