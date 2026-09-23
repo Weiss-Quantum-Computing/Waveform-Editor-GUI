@@ -276,6 +276,8 @@ then `sys.path.insert(0, './_p2')`, `parso.load_grammar(version='2.7')` and
 `grammar.iter_errors(tree)`. Current state: 0 grammar errors, pure ASCII,
 uniform CRLF, no tab-indented lines.
 
-**A clean parse is syntax only.** It is not a runtime test, and this has not yet
-been run on an actual Python 2.7 / Windows XP machine. That is the one thing
-still outstanding.
+**A clean parse is syntax only.** The runtime test is the lab machine itself:
+on 2026-09-23 both `--selftest` and `tests\smoke_test.py` passed on the
+Supertime PC under Python 2.7 (`C:\Python27\python.exe`; Python is not on
+that machine's PATH, so use the full path or the `.bat`). Repeat the two
+commands there after any change; there is no other 2.7 interpreter around.
