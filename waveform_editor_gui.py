@@ -1478,10 +1478,12 @@ def strip_bom(text):
     """Drop a byte-order mark, whichever way the interpreter handed it over.
 
     Python 2 reads the three bytes as three characters; Python 3 decodes them
-    to one. Testing the ordinal covers both without the source file itself
-    having to contain a non-ASCII character.
+    to one. Testing ordinals covers both without the source file itself
+    having to contain a non-ASCII character - and without comparing a
+    unicode string to a byte literal, which Python 2 only warns about and
+    then calls unequal, so the mark would have stayed on.
     """
-    if text[:3] == "\xef\xbb\xbf":
+    if len(text) >= 3 and [ord(c) for c in text[:3]] == [0xef, 0xbb, 0xbf]:
         return text[3:]
     if text and ord(text[0]) == 0xfeff:
         return text[1:]
@@ -4230,6 +4232,14 @@ def selftest():
         check("nested pair is not parallel", pok, False)
     except Exception as exc:
         failures.append("series pair: %r" % (exc,))
+
+    try:
+        check("bom as bytes-chars", strip_bom("\xef\xbb\xbf1,2"), "1,2")
+        check("bom as one char", strip_bom(u"\ufeff1,2"), u"1,2")
+        check("unicode without bom", strip_bom(u"1,2"), u"1,2")
+        check("bom on unicode chars", strip_bom(u"\xef\xbb\xbf1,2"), u"1,2")
+    except Exception as exc:
+        failures.append("strip_bom: %r" % (exc,))
 
     for line in failures:
         print("FAIL " + line)
