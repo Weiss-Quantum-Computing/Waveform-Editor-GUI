@@ -138,6 +138,40 @@ thing that is otherwise impossible once a record exists. Capped at 20,000 lines,
 because a Tk text widget holding a line per sample is comfortable there and
 unusable at a million.
 
+### Supertime ramps
+
+The sequence plays an EO ramp as a custom edge: a shape file plus a start and
+an end value in the log's units. Only those two numbers go through the EOM
+interpolation table (`EOM_XEO1_*.txt`); the shape's samples are laid between
+the two voltages as they are. This tab makes the shape files from an ILC
+drive (`time_us,voltage_V` under `#` comments, the `drive_*_iNN.csv` the
+Trek-EOM-ILC loop writes):
+
+1. **Read** the drive. The split is suggested at the middle of the plateau
+   (every sample within 0.1 % of the stroke below the maximum); type another
+   time to cut elsewhere.
+2. **Offset.** An ILC drive idles a few tens of mV above zero. *Subtract it
+   from every sample* takes the first sample's level out of the up ramp and
+   the last sample's out of the down ramp, so the shape keeps its slope and
+   only the level moves. *Only zero the end sample* reproduces the old
+   `_fixed` files, which open with a step of the offset's size in the first
+   2 us - kept for comparison, not recommended.
+3. **Grid** resamples both halves onto a coarser step (linear interpolation);
+   blank keeps the drive's. The down ramp keeps the drive's absolute time
+   axis unless *down ramp's time from 0* is ticked.
+4. **Write both files** puts `<stem>_up.csv` and `<stem>_down.csv` in the
+   Folder: `time_us,value`, comma, CRLF, no header, no final newline - byte
+   for byte what the sequence already reads. **Preview in library** adds the
+   two halves to the library instead, to look at.
+5. **Endpoints**: with an EOM table and the ramp's start and end values on
+   the coarse channel (log units, or volts with a `V`; the coarse zero used
+   in the sequence is 0.012, the fine channel does the EO-zero trim), it
+   prints the card voltage at each end and the stroke. Compare that stroke with the one the ILC drive was learned on:
+   the sequence rescales the shape onto the endpoints, and the Trek/EOM
+   chain is amplitude dependent.
+
+The drive file, table and endpoints are remembered between launches.
+
 ## Sample rate
 
 Optional, in the top bar. Leave it blank and everything is in samples. Set one

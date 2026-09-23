@@ -19,6 +19,11 @@ header. The reader is more tolerant than the writer - it also takes a single
 column of values, other delimiters, and `#` comment lines, so the AWG GUI's own
 `Waveforms/*.csv` cache files load here directly.
 
+The Supertime ramps tab turns an ILC drive (`time_us,voltage_V`) into the
+two shape files the sequence plays - cut at the plateau, DC offset taken out of
+every sample, `time_us,value` with no header - and works out the start and end
+numbers for the edge from an EOM table.
+
 Run with:  pythonw waveform_editor_gui.py     (pythonw = no console window)
            python  waveform_editor_gui.py --selftest    (checks the maths only)
 
@@ -816,6 +821,186 @@ def clipped(samples, low, high):
     if low > high:
         low, high = high, low
     return [min(max(v, low), high) for v in samples]
+
+
+# ---------------------------------------------------------------------------
+# Supertime ramps
+#
+# The sequence plays an EO ramp as a custom edge: a shape file, plus a start and
+# an end value in the log's units. Only those two numbers go through the EOM
+# interpolation table; the shape's own samples are laid between the two
+# voltages as they are. So a shape file wants to be the ILC drive cut at its
+# plateau, with the drive's small DC offset taken out of every sample (not just
+# the end sample forced to zero, which leaves a step of the offset's size in
+# the first 2 us), written as `time_us,value` with no header. These functions
+# do that; the Supertime tab is their panel.
+# ---------------------------------------------------------------------------
+
+_TIME_COLUMN_SCALE = {"time_us": 1.0, "t_us": 1.0, "time_ms": 1000.0,
+                      "t_ms": 1000.0, "time_s": 1e6, "t_s": 1e6, "time": 1.0}
+
+
+def read_timed(path):
+    """(time_us, values) from a two-column file with a time axis.
+
+    The ILC drives are `time_us,voltage_V` under `#` comment lines; a header
+    naming the time column in ms or s is rescaled to microseconds, and a file
+    with no header is taken to be in microseconds already.
+    """
+    columns, names = read_table(path)
+    if len(columns) < 2:
+        raise ValueError("%s has one column: a Supertime ramp needs a time "
+                         "axis beside the values" % (os.path.basename(path),))
+    index, _ = value_column(columns, names)
+    tcol = 1 if index == 0 else 0
+    scale = 1.0
+    if names and tcol < len(names):
+        scale = _TIME_COLUMN_SCALE.get(names[tcol].strip().lower(), 1.0)
+    t = [x * scale for x in columns[tcol]]
+    v = list(columns[index])
+    if len(t) < 3:
+        raise ValueError("only %d points in %s" % (len(t), os.path.basename(path)))
+    steps = [t[i + 1] - t[i] for i in xrange(len(t) - 1)]
+    if min(steps) <= 0 or max(steps) - min(steps) > 1e-6 * max(abs(steps[0]), 1.0):
+        raise ValueError("the time axis of %s is not a uniform grid"
+                         % (os.path.basename(path),))
+    return t, v
+
+
+def plateau_split(values, tolerance=1e-3):
+    """Index of the middle of the flat top: the up ramp is everything before it.
+
+    The flat top is every sample within `tolerance` of the full stroke below the
+    maximum. Splitting in the middle of it puts the cut where the drive is
+    flattest, so neither half starts or ends on a slope.
+    """
+    hi, lo = max(values), min(values)
+    if hi <= lo:
+        raise ValueError("that record is flat - there is no plateau to split at")
+    band = (hi - lo) * tolerance
+    top = [i for i, x in enumerate(values) if x >= hi - band]
+    return (top[0] + top[-1]) // 2
+
+
+def split_at_time(t, values, split_us):
+    """(up, down) halves, each (time_us, values), cut at the first sample >= split_us."""
+    # A grid written to ten digits reads back as 5673.999999999999, and that
+    # sample is the one at 5674: compare with a slack of a millionth of a step.
+    slack = 1e-6 * abs(t[1] - t[0])
+    k = len(t)
+    for i, x in enumerate(t):
+        if x >= split_us - slack:
+            k = i
+            break
+    if k < 2 or k > len(t) - 2:
+        raise ValueError("a split at %g us leaves nothing on one side" % (split_us,))
+    return (t[:k], values[:k]), (t[k:], values[k:])
+
+
+def remove_offset(values, anchor):
+    """(values with the offset taken out, the offset).
+
+    `anchor` is 'first' for an up ramp (the idle level is the first sample) or
+    'last' for a down ramp (it is the last). The offset is subtracted from every
+    sample, so the shape keeps its slope everywhere and only the level moves.
+    """
+    if anchor not in ("first", "last"):
+        raise ValueError("anchor is 'first' or 'last', not %r" % (anchor,))
+    offset = values[0] if anchor == "first" else values[-1]
+    return [x - offset for x in values], offset
+
+
+def zero_end_sample(values, anchor):
+    """The `_fixed` files' recipe: only the anchor sample set to zero. Kept so
+    a file made the old way can be reproduced and compared, not recommended."""
+    out = list(values)
+    if anchor == "first":
+        out[0] = 0.0
+    else:
+        out[-1] = 0.0
+    return out
+
+
+def resample_grid(t, values, step_us):
+    """(time_us, values) on a new grid of `step_us` from the first sample to the
+    last, linear interpolation. Points past the last source sample are not made:
+    the new grid ends at or before the source's last time."""
+    if step_us <= 0:
+        raise ValueError("the grid step must be positive")
+    src_dt = t[1] - t[0]
+    n = int(math.floor((t[-1] - t[0]) / step_us + 1e-9)) + 1
+    out_t, out_v = [], []
+    for i in xrange(n):
+        x = t[0] + i * step_us
+        pos = (x - t[0]) / src_dt
+        lo = int(pos)
+        if lo >= len(t) - 1:
+            out_v.append(values[-1])
+        else:
+            frac = pos - lo
+            out_v.append(values[lo] + (values[lo + 1] - values[lo]) * frac)
+        out_t.append(x)
+    return out_t, out_v
+
+
+def write_supertime_csv(path, t, values):
+    """`time_us,value` per line, comma, CRLF, no header, no final newline -
+    byte for byte the layout of the ramp files the sequence already reads."""
+    if len(t) != len(values):
+        raise ValueError("time and values differ in length")
+    lines = ["%.10g,%.10g" % (x, y) for x, y in zip(t, values)]
+    handle = open(path, "wb")
+    try:
+        handle.write("\r\n".join(lines).encode("ascii"))
+    finally:
+        handle.close()
+
+
+def read_eom_table(path):
+    """[(card_volts, log_units), ...] from an EOM_X*.txt table, sorted by units.
+
+    Left column is the card voltage, right column the number typed in the log
+    and the sequence; the sequence interpolates linearly between the rows.
+    """
+    columns, names = read_table(path)
+    if len(columns) != 2:
+        raise ValueError("%s has %d columns; an EOM table has two: card volts "
+                         "and log units" % (os.path.basename(path), len(columns)))
+    rows = sorted(zip(columns[0], columns[1]), key=lambda r: r[1])
+    for i in xrange(len(rows) - 1):
+        if rows[i + 1][0] < rows[i][0]:
+            raise ValueError("%s is not monotonic: the card voltage falls "
+                             "between %g and %g units"
+                             % (os.path.basename(path), rows[i][1], rows[i + 1][1]))
+    return rows
+
+
+def _interp_rows(rows, x, from_col, to_col):
+    if x <= rows[0][from_col]:
+        a, b = rows[0], rows[1]
+    elif x >= rows[-1][from_col]:
+        a, b = rows[-2], rows[-1]
+    else:
+        for i in xrange(len(rows) - 1):
+            if rows[i][from_col] <= x <= rows[i + 1][from_col]:
+                a, b = rows[i], rows[i + 1]
+                break
+    span = b[from_col] - a[from_col]
+    if span == 0:
+        return a[to_col]
+    return a[to_col] + (b[to_col] - a[to_col]) * (x - a[from_col]) / span
+
+
+def units_to_volts(rows, units):
+    """What the card puts out for a number typed in the sequence (the table's
+    own linear interpolation; beyond the last row the last segment is extended)."""
+    return _interp_rows(rows, units, 1, 0)
+
+
+def volts_to_units(rows, volts):
+    """The number to type into the sequence to get `volts` out of the card."""
+    return _interp_rows(rows, volts, 0, 1)
+
 
 
 SHAPE_PREFIX = "shape: "
@@ -2260,6 +2445,7 @@ class App(object):
                 ("cut", "Cut into pieces", self.tab_cut),
                 ("assemble", "Assemble", self.tab_assemble),
                 ("modify", "Modify", self.tab_modify),
+                ("supertime", "Supertime ramps", self.tab_supertime),
                 ("values", "Values", self.tab_values)):
             frame = ttk.Frame(self.tabs)
             self.tabs.add(frame, text=title)
@@ -3012,6 +3198,230 @@ class App(object):
 
     # -- closing -----------------------------------------------------------
 
+    def tab_supertime(self, parent):
+        """An ILC drive into the two shape files the sequence plays, and the
+        start/end numbers to type into the edge."""
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(row, text="Drive file:").pack(side="left")
+        self.st_file = tk.StringVar(value=self.cfg.get("st_file", ""))
+        ttk.Entry(row, textvariable=self.st_file, width=46).pack(side="left", padx=4)
+        ttk.Button(row, text="Browse...", command=self.st_browse).pack(side="left")
+        ttk.Button(row, text="Read", command=self.st_read).pack(side="left", padx=4)
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row, text="Split at").pack(side="left")
+        self.st_split = tk.StringVar()
+        ttk.Entry(row, textvariable=self.st_split, width=9).pack(side="left", padx=4)
+        ttk.Label(row, text="us").pack(side="left")
+        ttk.Button(row, text="Middle of the plateau",
+                   command=self.st_find_plateau).pack(side="left", padx=(4, 14))
+        ttk.Label(row, text="Grid").pack(side="left")
+        self.st_step = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.st_step, width=6).pack(side="left", padx=4)
+        ttk.Label(row, text="us (blank keeps the file's)").pack(side="left")
+        self.st_down_from_zero = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="down ramp's time from 0",
+                        variable=self.st_down_from_zero).pack(side="left", padx=(14, 0))
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row, text="Offset:").pack(side="left")
+        self.st_offset_mode = tk.StringVar(value="subtract")
+        ttk.Radiobutton(row, text="subtract it from every sample",
+                        variable=self.st_offset_mode, value="subtract").pack(side="left", padx=4)
+        ttk.Radiobutton(row, text="only zero the end sample (the old _fixed files)",
+                        variable=self.st_offset_mode, value="endsample").pack(side="left", padx=4)
+        ttk.Radiobutton(row, text="leave it",
+                        variable=self.st_offset_mode, value="keep").pack(side="left", padx=4)
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row, text="Write as").pack(side="left")
+        self.st_stem = tk.StringVar()
+        ttk.Entry(row, textvariable=self.st_stem, width=28).pack(side="left", padx=4)
+        ttk.Label(row, text="_up.csv / _down.csv in the folder above").pack(side="left")
+        ttk.Button(row, text="Write both files", command=self.st_write).pack(side="left", padx=(12, 4))
+        ttk.Button(row, text="Preview in library", command=self.st_preview).pack(side="left")
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(row, text="EOM table:").pack(side="left")
+        self.st_table = tk.StringVar(value=self.cfg.get("st_table", ""))
+        ttk.Entry(row, textvariable=self.st_table, width=34).pack(side="left", padx=4)
+        ttk.Button(row, text="Browse...", command=self.st_browse_table).pack(side="left")
+        ttk.Label(row, text="start").pack(side="left", padx=(12, 2))
+        self.st_zero = tk.StringVar(value=self.cfg.get("st_zero", "0.012"))
+        ttk.Entry(row, textvariable=self.st_zero, width=7).pack(side="left")
+        ttk.Label(row, text="end").pack(side="left", padx=(8, 2))
+        self.st_end = tk.StringVar(value=self.cfg.get("st_end", ""))
+        ttk.Entry(row, textvariable=self.st_end, width=7).pack(side="left")
+        ttk.Label(row, text="(coarse-channel log units, or volts with a V; the coarse zero is 0.012)").pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="Endpoints", command=self.st_endpoints).pack(side="left", padx=(10, 0))
+
+        self.st_note = ttk.Label(parent, text=(
+            "Only the start and end numbers go through the EOM table; the shape's "
+            "samples are laid between the two voltages as they are. So the file "
+            "is the drive cut at its plateau with the DC offset taken out of every "
+            "sample, and the endpoints are what set the stroke."),
+            foreground=NOTE_GREY, wraplength=760, justify="left")
+        self.st_note.pack(anchor="w", padx=8, pady=(2, 6))
+        self.st_data = None                                   # (t_us, values) last read
+
+    def st_browse(self):
+        path = filedialog.askopenfilename(
+            initialdir=os.path.dirname(self.st_file.get()) or self.folder.get() or ".",
+            filetypes=(("waveform files", "*.csv *.txt"), ("all", "*.*")))
+        if path:
+            self.st_file.set(os.path.normpath(path))
+            self.st_read()
+
+    def st_browse_table(self):
+        path = filedialog.askopenfilename(
+            initialdir=os.path.dirname(self.st_table.get()) or self.folder.get() or ".",
+            filetypes=(("EOM tables", "EOM_*.txt"), ("all", "*.*")))
+        if path:
+            self.st_table.set(os.path.normpath(path))
+
+    def st_read(self):
+        path = self.st_file.get().strip()
+        try:
+            t, v = read_timed(path)
+        except Exception as exc:
+            self.st_data = None
+            self.st_note.configure(text=str(exc), foreground=NOTE_WARN)
+            return None
+        self.st_data = (t, v)
+        self.cfg["st_file"] = path
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if not self.st_stem.get().strip():
+            self.st_stem.set(stem)
+        self.st_find_plateau(quiet=True)
+        self.st_note.configure(
+            text="%s: %s points, %g us grid, %g us long; first %.5g, last %.5g, "
+                 "peak %.5g (%s)" % (os.path.basename(path), fmt_count(len(t)),
+                                     t[1] - t[0], t[-1] - t[0], v[0], v[-1], max(v),
+                                     describe(v)),
+            foreground=NOTE_GREY)
+        self.log("Supertime: read %s, split suggested at %s us"
+                 % (os.path.basename(path), self.st_split.get()))
+        self.show_trace(v, "%s - %s" % (stem, describe(v)), key=("supertime", path, len(v)))
+        return self.st_data
+
+    def st_find_plateau(self, quiet=False):
+        if self.st_data is None and self.st_read() is None:
+            return
+        t, v = self.st_data
+        k = plateau_split(v)
+        self.st_split.set("%g" % (t[k],))
+        if not quiet:
+            self.log("Supertime: plateau middle at sample %d = %g us" % (k + 1, t[k]))
+
+    def st_halves(self):
+        """The two halves the panel describes, after the offset rule and any
+        regridding: [(label, anchor, t, values, offset), ...]."""
+        if self.st_data is None and self.st_read() is None:
+            raise ValueError("read a drive file first")
+        t, v = self.st_data
+        split = as_float(self.st_split.get(), -1.0)
+        if split < 0:
+            raise ValueError("the split time must be a number of microseconds")
+        up, down = split_at_time(t, v, split)
+        step = self.st_step.get().strip()
+        out = []
+        for label, anchor, (tt, vv) in (("up", "first", up), ("down", "last", down)):
+            mode = self.st_offset_mode.get()
+            offset = 0.0
+            if mode == "subtract":
+                vv, offset = remove_offset(vv, anchor)
+            elif mode == "endsample":
+                offset = vv[0] if anchor == "first" else vv[-1]
+                vv = zero_end_sample(vv, anchor)
+            if step:
+                tt, vv = resample_grid(tt, vv, as_float(step, 0.0))
+            if label == "down" and self.st_down_from_zero.get():
+                tt = [x - tt[0] for x in tt]
+            out.append((label, anchor, tt, vv, offset))
+        return out
+
+    def st_write(self):
+        try:
+            halves = self.st_halves()
+        except Exception as exc:
+            self.st_note.configure(text=str(exc), foreground=NOTE_WARN)
+            messagebox.showerror("Cannot write that", str(exc))
+            return
+        folder = self.folder.get().strip() or os.path.dirname(self.st_file.get())
+        stem = safe_name(self.st_stem.get().strip() or "ramp")
+        written = []
+        for label, anchor, tt, vv, offset in halves:
+            path = os.path.join(folder, "%s_%s.csv" % (stem, label))
+            if os.path.exists(path) and not messagebox.askyesno(
+                    "Overwrite?", "%s exists. Replace it?" % (path,)):
+                continue
+            write_supertime_csv(path, tt, vv)
+            written.append(path)
+            self.log("Supertime: wrote %s - %s points, %g..%g us, %s sample was "
+                     "%.5g (offset %s), values %.5g..%.5g"
+                     % (os.path.basename(path), fmt_count(len(vv)), tt[0], tt[-1],
+                        anchor, offset,
+                        {"subtract": "subtracted everywhere",
+                         "endsample": "end sample zeroed only",
+                         "keep": "left in"}[self.st_offset_mode.get()],
+                        min(vv), max(vv)))
+        self.st_note.configure(
+            text="wrote %s" % (", ".join(os.path.basename(p) for p in written) or "nothing"),
+            foreground=NOTE_GREY)
+        self.cfg["st_file"] = self.st_file.get()
+
+    def st_preview(self):
+        try:
+            halves = self.st_halves()
+        except Exception as exc:
+            self.st_note.configure(text=str(exc), foreground=NOTE_WARN)
+            return
+        stem = safe_name(self.st_stem.get().strip() or "ramp")
+        for label, anchor, tt, vv, offset in halves:
+            self.add_wave("%s_%s" % (stem, label), vv,
+                          "Supertime %s half, %g us grid, offset %.5g" % (label, tt[1] - tt[0], offset))
+
+    def st_parse_point(self, rows, text, what):
+        """One ramp endpoint as (log units, card volts); '9.16V' means volts."""
+        text = text.strip().lower()
+        if text.endswith("v"):
+            volts = as_float(text[:-1], None)
+            if volts is None:
+                raise ValueError("type the %s point in log units, or as volts with a V" % what)
+            return volts_to_units(rows, volts), volts
+        units = as_float(text, None)
+        if units is None:
+            raise ValueError("type the %s point in log units, or as volts with a V" % what)
+        return units, units_to_volts(rows, units)
+
+    def st_endpoints(self):
+        try:
+            rows = read_eom_table(self.st_table.get().strip())
+            zero, zero_v = self.st_parse_point(rows, self.st_zero.get() or "0.012", "start")
+            end_u, end_v = self.st_parse_point(rows, self.st_end.get(), "end")
+        except Exception as exc:
+            self.st_note.configure(text=str(exc), foreground=NOTE_WARN)
+            return
+        text = ("start %.4g units = %.4f V at the card; end %.4g units = %.4f V; "
+                "stroke %.4f V. Train the ILC on a target that idles at %.3f V and "
+                "peaks at %.3f V, not on 0 -> peak."
+                % (zero, zero_v, end_u, end_v, end_v - zero_v, zero_v, end_v))
+        if self.st_data is not None:
+            peak = max(self.st_data[1]) - min(self.st_data[1])
+            text += (" The loaded drive's own stroke is %.4f V; the sequence "
+                     "rescales the shape onto the endpoints, so a %.0f%% amplitude "
+                     "change from the learned one." % (peak, 100.0 * (end_v - zero_v) / peak - 100.0))
+        self.st_note.configure(text=text, foreground=NOTE_GREY)
+        self.log("Supertime endpoints: " + text)
+        self.cfg["st_table"] = self.st_table.get()
+        self.cfg["st_zero"] = self.st_zero.get()
+        self.cfg["st_end"] = self.st_end.get()
+
     def on_close(self):
         pending = [name for name in self.library if name not in self.saved]
         if pending and not messagebox.askokcancel(
@@ -3187,6 +3597,51 @@ def selftest():
     check("unique name", unique_name("a", {"a": 1, "a_2": 1}), "a_3")
     check("safe name", safe_name('a/b:c'), "a_b_c")
     check("fmt count", fmt_count(1234567), "1,234,567")
+
+    # Supertime ramps: the plateau split, the offset rule, the file layout and
+    # the endpoint table, on a trapezoid with the ILC drive's kind of offset.
+    trap = ([0.02] * 5 + [0.02 + 2.0 * i / 20.0 for i in xrange(1, 21)]
+            + [2.02] * 9 + [2.02 - 2.0 * i / 20.0 for i in xrange(1, 21)] + [0.02] * 5)
+    tt = [2.0 * i for i in xrange(len(trap))]
+    k = plateau_split(trap)
+    check("plateau middle", k, 28)          # top = samples 24..33
+    (tu, vu), (td, vd) = split_at_time(tt, trap, tt[k])
+    check("split lengths", (len(vu), len(vd)), (28, len(trap) - 28))
+    zu, off = remove_offset(vu, "first")
+    close("up offset", off, 0.02)
+    close("up first", zu[0], 0.0)
+    close("up last", zu[-1], 2.0)
+    zd, off = remove_offset(vd, "last")
+    close("down last", zd[-1], 0.0)
+    close("down first", zd[0], 2.0)
+    ez = zero_end_sample(vu, "first")
+    check("end sample only", (ez[0], ez[1]), (0.0, vu[1]))
+    rt, rv = resample_grid(tu, zu, 10.0)
+    check("regrid start", rt[0], tu[0])
+    check("regrid step", rt[1] - rt[0], 10.0)
+    close("regrid value", rv[1], zu[5])
+    try:
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "wf_editor_selftest_st.csv")
+        write_supertime_csv(path, tu, zu)
+        raw = open(path, "rb").read()
+        check("no header", raw[:4], b"0,0\r")
+        check("crlf only", raw.count(b"\n"), len(tu) - 1)
+        check("no final newline", raw[-1:] != b"\n", True)
+        back_t, back_v = read_timed(path)
+        check("supertime round trip", back_v, zu)
+        check("supertime times", back_t, tu)
+        tpath = os.path.join(tempfile.gettempdir(), "wf_editor_selftest_eom.txt")
+        open(tpath, "w").write("0.0\t0.0\n8.0\t10.0\n9.99\t12.0\n")
+        rows = read_eom_table(tpath)
+        close("units to volts", units_to_volts(rows, 5.0), 4.0)
+        close("volts to units", volts_to_units(rows, 4.0), 5.0)
+        close("units past the knee", units_to_volts(rows, 11.0), 8.995)
+        close("volts past the knee", volts_to_units(rows, 8.995), 11.0)
+        for p in (path, tpath):
+            os.remove(p)
+    except Exception as exc:
+        failures.append("supertime files: %r" % (exc,))
 
     for line in failures:
         print("FAIL " + line)

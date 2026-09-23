@@ -236,6 +236,62 @@ if "scope_capture" in app.library:
 else:
     failures.append("headed file did not load")
 
+# --- supertime ramps ------------------------------------------------------
+# An ILC-style drive with a DC offset, through the whole tab: read, plateau
+# split, both files written, preview, and the endpoint table.
+drive = os.path.join(folder, "drive_SMOKE_i00.csv")
+with open(drive, "w") as fh:
+    fh.write("# smoke drive\ntime_us,voltage_V\n")
+    for i in range(600):
+        t = 2.0 * i
+        if t < 200:
+            v = 0.02
+        elif t < 600:
+            v = 0.02 + 9.0 * (t - 200) / 400.0
+        elif t < 700:
+            v = 9.02
+        elif t < 1100:
+            v = 9.02 - 9.0 * (t - 700) / 400.0
+        else:
+            v = 0.02
+        fh.write("%g,%.6f\n" % (t, v))
+table = os.path.join(folder, "EOM_SMOKE.txt")
+with open(table, "w") as fh:
+    fh.write("-0.03\t0.012\n0.79\t1\n8.30\t10\n9.99\t12\n")
+step("tab supertime", lambda: app.tabs.select(app.tab_frames["supertime"]))
+step("supertime read", lambda: (app.st_file.set(drive), app.st_read()))
+if not app.st_split.get():
+    failures.append("supertime read did not suggest a split")
+step("supertime plateau", app.st_find_plateau)
+step("supertime preview", app.st_preview)
+step("supertime write", lambda: (app.folder.set(folder), app.st_stem.set("SMOKE"),
+                                 app.st_write()))
+for half in ("SMOKE_up.csv", "SMOKE_down.csv"):
+    path = os.path.join(folder, half)
+    if not os.path.exists(path):
+        failures.append("supertime did not write %s" % (half,))
+        continue
+    raw = open(path, "rb").read()
+    if raw.startswith(b"time") or b"#" in raw or not raw.count(b"\r\n"):
+        failures.append("%s is not the headerless CRLF layout" % (half,))
+    t_back, v_back = W.read_timed(path)
+    end = v_back[0] if half.endswith("up.csv") else v_back[-1]
+    if abs(end) > 1e-12:
+        failures.append("%s: the anchor sample is %g, not 0" % (half, end))
+step("supertime regrid", lambda: (app.st_step.set("10"), app.st_down_from_zero.set(True),
+                                  app.st_stem.set("SMOKE10"), app.st_write(),
+                                  app.st_step.set(""), app.st_down_from_zero.set(False)))
+t10, _ = W.read_timed(os.path.join(folder, "SMOKE10_down.csv"))
+if t10[0] != 0 or t10[1] - t10[0] != 10:
+    failures.append("regridded down ramp is %r..: not a 10 us grid from 0" % (t10[:3],))
+step("supertime endpoints", lambda: (app.st_table.set(table), app.st_zero.set("0V"),
+                                     app.st_end.set("10.97"), app.st_endpoints()))
+if "stroke" not in app.st_note.cget("text"):
+    failures.append("endpoints did not report a stroke: %r" % (app.st_note.cget("text"),))
+step("supertime endpoints in volts", lambda: (app.st_end.set("9.16V"), app.st_endpoints()))
+step("supertime endpoints in units", lambda: (app.st_zero.set("0.05"), app.st_end.set("10.97"),
+                                              app.st_endpoints()))
+
 # --- housekeeping ---------------------------------------------------------
 def _rename(new):
     app.ask_text = lambda *a, **k: new
