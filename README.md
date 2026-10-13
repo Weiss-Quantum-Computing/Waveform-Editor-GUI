@@ -77,6 +77,16 @@ min and max — so a 106,020-point record renders in 4 ms and shows what is
 actually in it, which a polyline squeezed into 700 pixels does neither.
 Hovering reads out the sample under the cursor.
 
+The mouse works as on the lab's other plots. Mouse wheel zooms about the
+cursor; right-drag pans; a right-click copies the hovered sample readout to the
+clipboard. Once zoomed or panned the view is held across redraws of the same
+record and a blue note says 'zoomed - Show all to reset'; Show all releases it.
+The left button stays the span picker (Cut tab), `Zoom to span` narrows the
+view to the picked span, and y always autoscales to what is in view, so
+Shift+wheel (y only elsewhere) does nothing here. The other GUIs get this from
+a shared `labplot` module; this one cannot import anything, so it is drawn by
+hand on the same canvas.
+
 ### Build a shape
 
 Sixteen shapes, ported from the AWG GUI sample for sample so a record built
@@ -240,6 +250,13 @@ middle half of the record.
   proportional and the columns of numbers stop lining up.
 - Settings (folder, sample rate, window size) live in
   `%APPDATA%\Waveform-Editor-GUI\config.json`.
+- **The mouse wheel goes to the focused widget on Windows**, which is usually
+  the entry box being typed in, so a `<MouseWheel>` binding on the canvas never
+  fires. It is bound application-wide (`bind_all`) and acted on only when
+  `winfo_containing` says the pointer is over the plot. Taking the focus on
+  hover would be the other fix, and it would steal it from the box being typed
+  in. `event.delta` is ±120 per notch; the clipboard goes through
+  `clipboard_clear` / `clipboard_append`, which both Pythons have.
 - Two million points is the cap. Measured on a modern machine, a million points
   builds in 0.4 s, writes in 0.9 s (21 MB) and reads back in 3 s, and the list
   itself holds about 32 MB — an XP-era machine is several times slower and has
@@ -260,10 +277,15 @@ every shape builds at the length asked for, the assembler's segment placement,
 and that a file written here reads back as the same numbers with the index
 column recognised rather than taken for samples.
 
-The GUI smoke test (`smoke.py`, kept with the session notes) builds the window
-and drives every panel — every tab, the plot redraw, the Assemble table's
-insert/reorder/delete, save-all, load-folder, and a `time_s,CH1_V,CH2_V` file
-loading with the right column picked.
+The GUI smoke test (`tests/smoke_test.py`) builds the window and drives every
+panel — every tab, the plot redraw, the Assemble table's insert/reorder/delete,
+save-all, load-folder, and a `time_s,CH1_V,CH2_V` file loading with the right
+column picked. The plot's mouse is driven with synthetic events against the
+real canvas geometry: wheel zoom in and out (anchor held under the cursor,
+Shift+wheel a no-op, a wheel over the library ignored), the view held across a
+redraw of the same record and dropped on a different one, right-drag pan (width
+kept, stops at the ends), right-click copy checked against the clipboard, and
+the zoomed note appearing and clearing on Show all.
 
 For the 2.7 grammar, `lib2to3` is gone from Python 3.13 and the parso Anaconda
 ships dropped its 2.7 grammar. The recipe that works here:
@@ -281,3 +303,8 @@ on 2026-09-23 both `--selftest` and `tests\smoke_test.py` passed on the
 Supertime PC under Python 2.7 (`C:\Python27\python.exe`; Python is not on
 that machine's PATH, so use the full path or the `.bat`). Repeat the two
 commands there after any change; there is no other 2.7 interpreter around.
+
+The plot's wheel zoom, right-drag pan and right-click copy came after that
+run and have not yet been on the 2.7 machine: they were only ever driven on
+Python 3 on Windows 11 by the smoke test's synthetic events, never by a real
+wheel on a 2.7 Tk. That is the one thing still outstanding.

@@ -77,6 +77,146 @@ step("take piece", app.do_take)
 step("zoom to span", app.do_zoom_span)
 step("show all", app.do_zoom_all)
 step("clear span", lambda: app.on_plot_span(None))
+
+
+# --- wheel zoom, right-drag pan, right-click copy ----------------------------
+# The handlers are driven with synthetic events: the canvas is real, so the
+# geometry is real, and the only thing faked is the mouse. `x_root`/`y_root`
+# are what the application-wide wheel binding looks at to decide whether the
+# pointer is over the plot at all.
+class Fake(object):
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+def plot_point(fx, fy):
+    """Canvas pixel (fx, fy fractions across the axes) and its screen position."""
+    left, top, right, bottom = app.plot._box()
+    x = int(left + fx * (right - left))
+    y = int(top + fy * (bottom - top))
+    return x, y, app.plot.canvas.winfo_rootx() + x, app.plot.canvas.winfo_rooty() + y
+
+
+def check(condition, message):
+    if not condition:
+        failures.append(message)
+
+
+root.update_idletasks()
+root.update()
+plot = app.plot
+n_shown = len(plot.samples)
+check(n_shown > 10, "cut preview has %d samples, cannot test the mouse" % (n_shown,))
+check(plot.view is None, "view not at the full record before zooming")
+check(app.zoom_note.cget("text") == "", "zoom note set before any zoom")
+
+# wheel in, pointer over the plot
+x, y, rx, ry = plot_point(0.5, 0.5)
+step("wheel in", lambda: plot._wheel(Fake(x=x, y=y, x_root=rx, y_root=ry,
+                                           delta=120, state=0)))
+check(plot.view is not None, "wheel over the plot did not zoom in")
+if plot.view:
+    lo, hi = plot.view
+    check(1 <= lo < hi <= n_shown, "zoomed view out of range: %r" % (plot.view,))
+    check(hi - lo < n_shown - 1, "zoomed view is not narrower: %r" % (plot.view,))
+    check(abs((hi - lo) - (n_shown - 1) / 1.25) <= 2,
+          "one notch should narrow by 1.25, got %r of %d" % (plot.view, n_shown))
+check(app.zoom_note.cget("text") == W.ZOOM_NOTE,
+      "zoom note after a wheel: %r" % (app.zoom_note.cget("text"),))
+
+# the sample under the cursor stays under the cursor
+anchor_before = plot.sample_at(x)
+step("wheel in again", lambda: plot._wheel(Fake(x=x, y=y, x_root=rx, y_root=ry,
+                                                 delta=120, state=0)))
+check(abs(plot.sample_at(x) - anchor_before) <= 2,
+      "zoom moved the sample under the cursor from %r to %r"
+      % (anchor_before, plot.sample_at(x)))
+
+# Shift+wheel keeps the x range (y autoscales here, so it is a no-op)
+held = plot.view
+step("shift wheel", lambda: plot._wheel(Fake(x=x, y=y, x_root=rx, y_root=ry,
+                                              delta=120, state=0x0001)))
+check(plot.view == held, "Shift+wheel changed the x range: %r -> %r"
+      % (held, plot.view))
+
+# a wheel somewhere else in the window is somebody else's
+elsewhere = Fake(x=5, y=5, x_root=app.listbox.winfo_rootx() + 5,
+                 y_root=app.listbox.winfo_rooty() + 5, delta=120, state=0)
+step("wheel off the plot", lambda: plot._wheel(elsewhere))
+check(plot.view == held, "a wheel over the library zoomed the plot")
+
+# the view is held across a redraw of the same record
+step("redraw while zoomed", app.refresh_preview)
+check(plot.view == held, "redraw of the same record lost the view: %r -> %r"
+      % (held, plot.view))
+check(app.zoom_note.cget("text") == W.ZOOM_NOTE, "zoom note lost on a redraw")
+
+# right-drag pans, by the width of the drag
+lo, hi = plot.view
+x1, y1, _, _ = plot_point(0.5, 0.5)
+x2, y2, _, _ = plot_point(0.2, 0.5)
+step("right press", lambda: plot._press3(Fake(x=x1, y=y1)))
+step("right drag", lambda: plot._drag3(Fake(x=x2, y=y2)))
+step("right release", lambda: plot._release3(Fake(x=x2, y=y2)))
+check(plot.view is not None and plot.view[0] > lo,
+      "a right-drag to the left did not pan forward: %r -> %r" % ((lo, hi), plot.view))
+if plot.view:
+    check(abs((plot.view[1] - plot.view[0]) - (hi - lo)) <= 2,
+          "panning changed the width: %r -> %r" % ((lo, hi), plot.view))
+# and it cannot leave the record
+far = plot_point(0.5, 0.5)
+step("pan off the end", lambda: (plot._press3(Fake(x=far[0], y=far[1])),
+                                 plot._drag3(Fake(x=-5000, y=far[1])),
+                                 plot._release3(Fake(x=-5000, y=far[1]))))
+check(plot.view is not None and plot.view[1] == n_shown,
+      "panning past the end did not stop at the end: %r" % (plot.view,))
+check(plot.view is not None and plot.view[0] >= 1, "panned before sample 1")
+
+# a right-click that did not move copies the readout
+try:
+    root.clipboard_clear()
+    root.clipboard_append("stale")
+except Exception:
+    pass
+x, y, _, _ = plot_point(0.5, 0.5)
+# Released one pixel over: still a click, and the readout is the one under
+# the release, which is where the hover label was pointing.
+step("right click", lambda: (plot._press3(Fake(x=x, y=y)),
+                             plot._release3(Fake(x=x + 1, y=y))))
+expect = plot.readout_at(x + 1, y)
+if expect is None:
+    failures.append("no readout under the right-click")
+else:
+    want = app.readout_text(*expect)
+    check(want.startswith("sample "), "readout text is %r" % (want,))
+    try:
+        got = root.clipboard_get()
+    except Exception:
+        got = "<clipboard_get failed>"
+    check(got == want, "clipboard has %r, hover readout is %r" % (got, want))
+    check(app.hover.cget("text") == "copied " + want,
+          "hover label after a copy: %r" % (app.hover.cget("text"),))
+
+# wheel out past the whole record is the whole record
+step("wheel out", lambda: [plot.zoom_at(x, 1 / 1.25) for _ in range(12)])
+check(plot.view is None, "wheeling out did not come back to the full record")
+check(app.zoom_note.cget("text") == "", "zoom note after wheeling all the way out")
+
+# Show all is Home: it clears the view and the note
+step("zoom for show all", lambda: plot.zoom_at(x, 4.0))
+check(plot.view is not None, "zoom_at(4.0) did not zoom")
+step("show all clears it", app.do_zoom_all)
+check(plot.view is None, "Show all did not reset the view")
+check(app.zoom_note.cget("text") == "", "Show all did not clear the zoom note")
+
+# a different record starts at the full extent again
+step("zoom then switch", lambda: (plot.zoom_at(x, 4.0),
+                                  app.cut_source.set(names[1]),
+                                  app.refresh_preview()))
+check(plot.view is None, "a different record kept the old view: %r" % (plot.view,))
+check(app.zoom_note.cget("text") == "", "zoom note survived a change of record")
+step("back to the first", lambda: (app.cut_source.set(names[0]),
+                                   app.refresh_preview()))
 step("percent span", lambda: (app.cut_first.set("25%"), app.cut_last.set("75%"),
                               app.on_cut_change()))
 step("take percent piece", app.do_take)

@@ -111,6 +111,8 @@ AXIS_COLOUR = "#000000"
 NOTE_GREY = "#666666"
 NOTE_WARN = "#cc6600"
 BOUND_COLOUR = "#b0b0b0"          # segment boundaries in an assembled record
+ZOOM_NOTE_COLOUR = "#1c4fa8"      # "zoomed - Show all to reset", as on the other plots
+ZOOM_NOTE = "zoomed - Show all to reset"
 
 # Courier New rather than Consolas: Consolas ships with Vista and Office 2007,
 # so on a bare XP install it silently falls back to something proportional and
@@ -1712,16 +1714,27 @@ class Plot(object):
     """One waveform, optionally with a span picked out of it.
 
     `on_span` is called with (first, last) as a drag happens and with None when
-    a click clears it; `on_hover` with (sample number, value) or None. Both are
-    how the panels get a mouse that means something without any of them knowing
-    anything about pixels.
+    a click clears it; `on_hover` with (sample number, value) or None;
+    `on_copy` with (sample number, value) when a right-click asks for the
+    readout; `on_view` with the (first, last) window or None whenever the
+    view changes. All of them are how the panels get a mouse that means
+    something without any of them knowing anything about pixels.
+
+    The mouse is the same as on the lab's other plots: the wheel zooms about
+    the cursor, a right-drag pans, a right-click copies the readout. Those
+    live in labplot.PlotPanel elsewhere; this program cannot import it (XP,
+    2.7, standard library only), so they are drawn by hand here too.
     """
 
-    def __init__(self, master, height=210, on_span=None, on_hover=None):
+    WHEEL_FACTOR = 1.25           # per notch, same as the other lab plots
+
+    def __init__(self, master, height=210, on_span=None, on_hover=None,
+                 on_copy=None, on_view=None):
         self.canvas = tk.Canvas(master, height=height, background="white",
                                 highlightthickness=1,
                                 highlightbackground="#b0b0b0")
         self.on_span, self.on_hover = on_span, on_hover
+        self.on_copy, self.on_view = on_copy, on_view
         self.samples = []
         self.marks = []               # (start, label, points) per segment
         self.span = None              # (first, last), 1-based inclusive
@@ -1731,12 +1744,23 @@ class Plot(object):
         self.version = 0              # bumped whenever the samples change
         self._cache = (None, None)
         self._drag_from = None
+        self._pan_from = None         # (x, y, window at press) for a right-drag
         self.canvas.bind("<Configure>", lambda e: self.draw())
         self.canvas.bind("<Button-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<Button-3>", self._press3)
+        self.canvas.bind("<B3-Motion>", self._drag3)
+        self.canvas.bind("<ButtonRelease-3>", self._release3)
         self.canvas.bind("<Motion>", self._motion)
         self.canvas.bind("<Leave>", lambda e: self._hover(None))
+        # On Windows the wheel goes to the FOCUSED widget, which is usually
+        # an entry box, so a binding on the canvas never fires while one is
+        # being typed in. Bound application-wide instead, and acted on only
+        # when the pointer is over this canvas - taking the focus on hover
+        # would be the other fix, and it would steal it from the box being
+        # typed in.
+        self.canvas.bind_all("<MouseWheel>", self._wheel, add="+")
 
     # -- what is shown -----------------------------------------------------
 
@@ -1752,6 +1776,7 @@ class Plot(object):
             self.view = None
         self._clamp_view()
         self.draw()
+        self._view_changed()
 
     def set_span(self, span):
         self.span = span
@@ -1761,6 +1786,7 @@ class Plot(object):
         self.view = view
         self._clamp_view()
         self.draw()
+        self._view_changed()
 
     def _clamp_view(self):
         n = len(self.samples)
@@ -1771,11 +1797,78 @@ class Plot(object):
         lo, hi = max(1, int(lo)), min(n, int(hi))
         self.view = (lo, hi) if hi - lo >= 1 else None
 
+    def _view_changed(self):
+        if self.on_view:
+            self.on_view(self.view)
+
     def _window(self):
         n = len(self.samples)
         if self.view:
             return self.view
         return (1, n)
+
+    def _fit_view(self, lo, hi):
+        """A (lo, hi) window SLID back inside the record rather than clipped.
+
+        Clamping each end on its own, which is what `_clamp_view` does to a
+        typed span, would shrink a window that was panned past the end - so
+        a pan would zoom. Sliding it keeps the width the user chose; a window
+        at least as wide as the record is the whole record.
+        """
+        n = len(self.samples)
+        if n < 2:
+            return None
+        width = hi - lo
+        if width >= n - 1:
+            return None
+        if lo < 1:
+            lo, hi = 1, 1 + width
+        if hi > n:
+            lo, hi = n - width, n
+        lo = int(round(lo))
+        hi = int(round(hi))
+        if hi - lo < 2:                      # three samples is as far in as it goes
+            hi = min(n, lo + 2)
+            lo = max(1, hi - 2)
+        return (max(1, lo), min(n, hi))
+
+    def zoom_at(self, px, factor):
+        """Narrow (factor > 1) or widen the window about the pixel column `px`.
+
+        The sample under the cursor stays under the cursor, which is what
+        makes zooming with the wheel usable: aim at the feature, roll.
+        """
+        if len(self.samples) < 2 or factor <= 0:
+            return
+        left, _, right, _ = self._box()
+        if right <= left:
+            return
+        lo, hi = self._window()
+        frac = min(max((px - left) / float(right - left), 0.0), 1.0)
+        anchor = lo + frac * (hi - lo)
+        width = (hi - lo) / float(factor)
+        new_lo = anchor - frac * width
+        self.view = self._fit_view(new_lo, new_lo + width)
+        self.draw()
+        self._view_changed()
+
+    def pan_to(self, window, dx):
+        """Show `window` (the one at the start of a drag) moved `dx` pixels.
+
+        Always measured from the window at the press rather than from the last
+        motion event, so a long drag does not drift by a sample per event
+        from the rounding.
+        """
+        if len(self.samples) < 2 or window is None:
+            return
+        left, _, right, _ = self._box()
+        if right <= left:
+            return
+        lo, hi = window
+        shift = -dx / float(right - left) * (hi - lo)
+        self.view = self._fit_view(lo + shift, hi + shift)
+        self.draw()
+        self._view_changed()
 
     # -- geometry ----------------------------------------------------------
 
@@ -1971,18 +2064,74 @@ class Plot(object):
             if self.on_span:
                 self.on_span(None)
 
+    # The right button pans; a right-click that did not move copies the
+    # readout under it. The left button is the span picker on the Cut tab,
+    # so the pan could not go there.
+
+    def _press3(self, event):
+        if not self.samples:
+            return
+        self._pan_from = (event.x, event.y, self._window())
+
+    def _drag3(self, event):
+        if self._pan_from is None:
+            return
+        self.pan_to(self._pan_from[2], event.x - self._pan_from[0])
+
+    def _release3(self, event):
+        if self._pan_from is None:
+            return
+        x0, y0, _window = self._pan_from
+        self._pan_from = None
+        if abs(event.x - x0) < 3 and abs(event.y - y0) < 3:
+            what = self.readout_at(event.x, event.y)
+            if what is not None and self.on_copy:
+                self.on_copy(what)
+
+    def _wheel(self, event):
+        """Application-wide wheel: zoom only when the pointer is over the plot.
+
+        Windows delivers the event to the focused widget, so the pointer is
+        found from the screen coordinates rather than trusted from the event.
+        """
+        if not self.samples:
+            return
+        try:
+            under = self.canvas.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            under = None
+        if under is not self.canvas:
+            return
+        state = getattr(event, "state", 0)
+        try:
+            state = int(state)
+        except (TypeError, ValueError):
+            state = 0
+        if state & 0x0001:                # Shift: y only, and y autoscales here
+            return
+        delta = getattr(event, "delta", 0) or 0
+        if delta == 0:
+            return
+        px = event.x_root - self.canvas.winfo_rootx()
+        factor = self.WHEEL_FACTOR if delta > 0 else 1.0 / self.WHEEL_FACTOR
+        self.zoom_at(px, factor)
+
+    def readout_at(self, px, py):
+        """(sample number, value) under a canvas pixel, or None outside the axes."""
+        if not self.samples:
+            return None
+        left, top, right, bottom = self._box()
+        if not (left <= px <= right and top <= py <= bottom):
+            return None
+        index = self.sample_at(px)
+        if index is None:
+            return None
+        return (index, self.samples[index - 1])
+
     def _motion(self, event):
         if not self.samples or not self.on_hover:
             return
-        left, top, right, bottom = self._box()
-        if not (left <= event.x <= right and top <= event.y <= bottom):
-            self._hover(None)
-            return
-        index = self.sample_at(event.x)
-        if index is None:
-            self._hover(None)
-            return
-        self._hover((index, self.samples[index - 1]))
+        self._hover(self.readout_at(event.x, event.y))
 
     def _hover(self, what):
         if self.on_hover:
@@ -2294,18 +2443,24 @@ class App(object):
         self.caption.grid(row=0, column=0, sticky="w", padx=6, pady=(4, 2))
 
         self.plot = Plot(frame, on_span=self.on_plot_span,
-                         on_hover=self.on_plot_hover)
+                         on_hover=self.on_plot_hover,
+                         on_copy=self.on_plot_copy, on_view=self.on_plot_view)
         self.plot.canvas.grid(row=1, column=0, sticky="nsew", padx=6)
 
         under = ttk.Frame(frame)
         under.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
         self.hover = ttk.Label(under, text="", foreground=NOTE_GREY,
-                               font=MONO_FONT, width=34)
+                               font=MONO_FONT, width=44)
         self.hover.pack(side="left")
         ttk.Button(under, text="Show all",
                    command=self.do_zoom_all).pack(side="right")
         ttk.Button(under, text="Zoom to span",
                    command=self.do_zoom_span).pack(side="right", padx=(0, 4))
+        # Says when the view is narrower than the record, because a zoomed
+        # view is held across redraws and a held view with nothing saying so
+        # looks like a record that got shorter. Show all is the Home here.
+        self.zoom_note = ttk.Label(under, text="", foreground=ZOOM_NOTE_COLOUR)
+        self.zoom_note.pack(side="right", padx=(0, 8))
 
     def build_log(self, parent):
         frame = ttk.Frame(parent)
@@ -2718,18 +2873,41 @@ class App(object):
 
     # -- preview routing ---------------------------------------------------
 
+    def readout_text(self, index, value):
+        """The hover line for one sample - and what a right-click copies."""
+        if self.rate() > 0:
+            return "sample %s (%s) = %.6g" % (fmt_count(index),
+                                             fmt_secs((index - 1) / self.rate()),
+                                             value)
+        return "sample %s = %.6g" % (fmt_count(index), value)
+
     def on_plot_hover(self, what):
         if not what:
             self.hover.configure(text="")
             return
         index, value = what
-        if self.rate() > 0:
-            self.hover.configure(text="sample %s (%s) = %.6g"
-                                 % (fmt_count(index),
-                                    fmt_secs((index - 1) / self.rate()), value))
-        else:
-            self.hover.configure(text="sample %s = %.6g"
-                                 % (fmt_count(index), value))
+        self.hover.configure(text=self.readout_text(index, value))
+
+    def on_plot_copy(self, what):
+        """A right-click without a drag: the readout goes to the clipboard."""
+        index, value = what
+        text = self.readout_text(index, value)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            self.hover.configure(text="clipboard not available")
+            return
+        shown = "copied " + text
+        self.hover.configure(text=shown)
+
+        def settle():
+            if "%s" % (self.hover.cget("text"),) == shown:
+                self.hover.configure(text=text)
+        self.root.after(1200, settle)
+
+    def on_plot_view(self, view):
+        self.zoom_note.configure(text=ZOOM_NOTE if view else "")
 
     def on_plot_span(self, span):
         """A drag on the preview fills in the Cut tab's From and To."""
