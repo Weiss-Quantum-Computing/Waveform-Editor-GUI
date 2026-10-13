@@ -2466,8 +2466,10 @@ class App(object):
         frame = ttk.Frame(parent)
         frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 8))
         frame.columnconfigure(0, weight=1)
-        self.logbox = tk.Text(frame, height=5, wrap="word", font=MONO_FONT,
-                              background="#fbfbfb")
+        # width=20 for the same reason as the Values box: the column, not
+        # the 80-character Tk default, decides how wide the log is.
+        self.logbox = tk.Text(frame, height=5, width=20, wrap="word",
+                              font=MONO_FONT, background="#fbfbfb")
         bar = ttk.Scrollbar(frame, orient="vertical", command=self.logbox.yview)
         self.logbox.configure(yscrollcommand=bar.set, state="disabled")
         self.logbox.grid(row=0, column=0, sticky="ew")
@@ -3780,7 +3782,12 @@ class App(object):
         box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         box.columnconfigure(0, weight=1)
         box.rowconfigure(0, weight=1)
-        self.values_box = tk.Text(box, height=7, wrap="none", font=MONO_FONT)
+        # width=20 is nominal: the grid cell (sticky, weight 1) sets the real
+        # size. Left at the Tk default of 80 characters the box asks for
+        # 80 x 7 px plus the scrollbar, 581 px in Courier New 9, and the
+        # tab cannot shrink below that at the 880 px minimum window.
+        self.values_box = tk.Text(box, height=7, width=20, wrap="none",
+                                  font=MONO_FONT)
         bar = ttk.Scrollbar(box, orient="vertical", command=self.values_box.yview)
         self.values_box.configure(yscrollcommand=bar.set)
         self.values_box.grid(row=0, column=0, sticky="nsew")
