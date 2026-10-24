@@ -453,6 +453,27 @@ for entry in ("timed_own.txt", "timed_box.txt", "timed_agree.txt", "timed_nobox.
     if os.path.exists(os.path.join(folder, entry)):
         os.remove(os.path.join(folder, entry))
 
+# --- Save all refuses two names that are one file (WE-3) --------------------
+# On Windows `Ramp` and `ramp` are the same file: the second must not silently
+# replace the first with both flagged saved.
+told = []
+real_showinfo = W.messagebox.showinfo
+dup_folder = tempfile.mkdtemp()
+step("two names, one file", lambda: (app.add_wave("Ramp", [0.0, 1.0], "case test"),
+                                     app.add_wave("ramp", [1.0, 0.0], "case test")))
+if os.path.normcase("A") == "a" and "Ramp" in app.library and "ramp" in app.library:
+    W.messagebox.showinfo = lambda *a, **k: told.append(a)
+    step("save all with a case clash", lambda: _save_all(dup_folder))
+    W.messagebox.showinfo = real_showinfo
+    check(not os.listdir(dup_folder), "Save all wrote files despite a name clash: %r"
+          % (os.listdir(dup_folder),))
+    check(len(told) == 1, "Save all did not say why it refused (%d messages)" % (len(told),))
+    check("Ramp" not in app.saved and "ramp" not in app.saved,
+          "a refused Save all flagged the clashing names saved")
+step("drop the case test", lambda: [(app.library.pop(n, None), app.saved.discard(n))
+                                    for n in ("Ramp", "ramp")] and app.refresh_library())
+os.rmdir(dup_folder)
+
 # --- supertime ramps ------------------------------------------------------
 # An ILC-style drive with a DC offset, through the whole tab: read, plateau
 # split, both files written, preview, and the endpoint table.

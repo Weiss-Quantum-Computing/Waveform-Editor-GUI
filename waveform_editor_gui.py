@@ -1713,6 +1713,19 @@ def safe_name(text):
     return out.strip() or "waveform"
 
 
+def save_all_collisions(names, folder):
+    """Groups of names that Save all would write to one file, in list order.
+
+    By the file each one becomes, through os.path.normcase - which on Windows
+    folds case, so `Ramp` and `ramp` are one file there - and safe_name.
+    """
+    by_path = OrderedDict()
+    for name in names:
+        key = os.path.normcase(os.path.join(folder, safe_name(name) + ".csv"))
+        by_path.setdefault(key, []).append(name)
+    return [group for group in by_path.values() if len(group) > 1]
+
+
 def unique_name(base, taken):
     """`base`, or `base_2`, `base_3`... - the first one nothing else is using."""
     name = safe_name(base)
@@ -2869,6 +2882,21 @@ class App(object):
             title="Save every waveform in the library as a CSV",
             initialdir=self.start_dir())
         if not folder:
+            return
+        # Two library names can land on one file - on Windows `Ramp` and
+        # `ramp` are the same file - and the second would silently replace
+        # the first with both flagged saved. Refused before anything is
+        # written (WE-3).
+        same_file = save_all_collisions(list(self.library), folder)
+        if same_file:
+            shown = "\n".join(["  " + " / ".join(group) for group in same_file[:6]])
+            self.log("Not saved: library names that are one file on disk: %s"
+                     % ("; ".join([" / ".join(group) for group in same_file]),))
+            messagebox.showinfo(
+                "Names share a file",
+                "These library names would be written to the same file, so one "
+                "would replace the other:\n\n%s\n\nRename one of each group "
+                "(Rename under the library) and save again." % (shown,))
             return
         clashes = [name for name in self.library
                    if os.path.exists(os.path.join(folder, safe_name(name) + ".csv"))]
@@ -4624,6 +4652,11 @@ def selftest():
     check("one column", value_column(columns, names), (0, False))
 
     check("unique name", unique_name("a", {"a": 1, "a_2": 1}), "a_3")
+    # WE-3: names Save all would write to one file.
+    check("save all collision", save_all_collisions(["a/b", "x", "a_b"], "f"),
+          [["a/b", "a_b"]])
+    check("save all case", save_all_collisions(["Ramp", "ramp"], "f"),
+          [["Ramp", "ramp"]] if os.path.normcase("A") == "a" else [])
     check("safe name", safe_name('a/b:c'), "a_b_c")
     check("fmt count", fmt_count(1234567), "1,234,567")
 
