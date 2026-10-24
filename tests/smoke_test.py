@@ -8,8 +8,12 @@ extend it with every feature.
 
     python tests/smoke_test.py
 
-Runs on either Python, and needs no instruments. A window flashes up while it
-runs.
+Runs on either Python, and needs no instruments. It never reads or writes the
+real settings file: CONFIG_PATH points at an empty temp folder before the window
+is built, so a saved folder, rate or ILC-header tick cannot change the result.
+The window is parked off screen at +6000+200 rather than withdrawn - the wheel
+checks find the plot with winfo_containing and the edge checks measure real
+widths, and both need a mapped window.
 """
 import os
 import sys
@@ -31,8 +35,14 @@ def step(name, fn):
         failures.append(name + "\n" + traceback.format_exc())
 
 
+# The App reads folder, rate, ILC header and geometry from CONFIG_PATH: give it
+# a fresh one, so the test runs on the defaults whatever the user last saved.
+config_folder = tempfile.mkdtemp()
+real_config = W.CONFIG_PATH
+W.CONFIG_PATH = os.path.join(config_folder, "config.json")
+
 root = W.tk.Tk()
-root.geometry("1010x730")
+root.geometry("1010x730+6000+200")
 app = W.App(root)
 # Silence the dialogs: a smoke test must never sit waiting on a message box.
 W.messagebox.showerror = lambda *a, **k: failures.append("showerror " + repr(a))
@@ -541,6 +551,12 @@ root.destroy()
 for entry in os.listdir(folder):
     os.remove(os.path.join(folder, entry))
 os.rmdir(folder)
+
+if W.CONFIG_PATH == real_config or not W.CONFIG_PATH.startswith(config_folder):
+    failures.append("CONFIG_PATH was not the sandboxed one: %r" % (W.CONFIG_PATH,))
+for entry in os.listdir(config_folder):
+    os.remove(os.path.join(config_folder, entry))
+os.rmdir(config_folder)
 
 if failures:
     for item in failures:
