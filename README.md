@@ -68,8 +68,9 @@ the AWG panels would upload such a file as a zero record.
 Which column holds the samples is worked out rather than assumed. The
 `index,value` pair this program writes is recognised outright, so reloading its
 own output never asks anything; `time_us,voltage_V` picks the volts, not the
-time axis; anything genuinely ambiguous puts up a column chooser rather than
-guessing. Getting this wrong is quiet and nasty — a time axis read as samples
+time axis; anything genuinely ambiguous - including a header with more than
+one value column, like Scope Grab's `time_s,CH1_V,CH2_V` - puts up a column
+chooser rather than guessing (`Load folder` takes the first and logs which). Getting this wrong is quiet and nasty — a time axis read as samples
 normalises into a clean ramp, so it looks like a plausible waveform rather than
 like a mistake.
 

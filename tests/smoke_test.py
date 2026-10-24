@@ -386,6 +386,17 @@ if "scope_capture" in app.library:
         failures.append("headed file picked the wrong column: %r" % (got[:3],))
 else:
     failures.append("headed file did not load")
+# Two named channels: a single load asks which one rather than taking CH1 (WE-5).
+picked = []
+app.ask_column = lambda columns, names, filename: (picked.append(names), 2)[1]
+step("load a two-channel file asking", lambda: app.load_one(odd, ask=True))
+del app.ask_column
+check(len(picked) == 1, "a two-channel file did not ask which column")
+if "scope_capture_2" in app.library:
+    check(abs(app.library["scope_capture_2"][0] - 1.0) < 1e-12,
+          "the chosen CH2 column was not the one loaded")
+else:
+    failures.append("two-channel file did not load after the column was chosen")
 
 # --- a timed file keeps its own grid (WE-1) -------------------------------
 # An ILC drive on the 2 us grid loaded while the rate box says 1 MHz: an

@@ -1611,15 +1611,18 @@ def value_column(columns, names):
     """(which column holds the samples, whether that is a guess worth asking about).
 
     The format this program writes - index, value - is recognised outright, so
-    reloading its own output never asks anything.
+    reloading its own output never asks anything. A header with more than one
+    named value column (Scope Grab's time_s,CH1_V,CH2_V) offers the first but
+    counts as a guess: which channel is wanted is not in the file (WE-5).
     """
     count = len(columns)
     if count == 1:
         return 0, False
     if names and len(names) == count:
-        for i, name in enumerate(names):
-            if name.strip().lstrip("#").strip().lower() not in INDEX_NAMES:
-                return i, False
+        values = [i for i, name in enumerate(names)
+                  if name.strip().lstrip("#").strip().lower() not in INDEX_NAMES]
+        if values:
+            return values[0], len(values) > 1
     if count == 2:
         # Either the index this program writes or a time axis from something
         # else; both mean the samples are in the second column.
@@ -4683,6 +4686,10 @@ def selftest():
     columns, names = table_from_lines(["idx\tvolts", "1\t0.5", "2\t0.25"])
     check("header names", names, ["idx", "volts"])
     check("header column", value_column(columns, names), (1, False))
+    columns, names = table_from_lines(["time_s,CH1_V,CH2_V", "0,1,2", "1e-6,1,2"])
+    check("two channels ask", value_column(columns, names), (1, True))
+    columns, names = table_from_lines(["time_us,voltage_V", "0,1", "2,1"])
+    check("one channel does not", value_column(columns, names), (1, False))
     columns, names = table_from_lines(["# AWG cache", "0.5", "0.25", "0.125"])
     check("one column", value_column(columns, names), (0, False))
     # WE-4: nan / inf stop the read at their line, and the writers and the
