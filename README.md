@@ -42,6 +42,15 @@ purpose — with no time axis it would read the index as seconds — so a record
 that is going back to the ILC goes out with the box ticked. The setting is
 remembered between launches.
 
+A record loaded from a file with a time column keeps that column's grid (its
+library note says e.g. `2 us grid`), and so do its cuts, its same-length
+Modify results and the Supertime/Series previews. When the rate box disagrees
+with a record's own grid, an ILC-header save asks: **Yes** writes it on its own
+grid, **No** at the box's rate (the time axis changes, so it plays at a
+different speed), **Cancel** writes nothing. With the box empty, a record that
+knows its own grid is written on it. Before this, a 2 µs drive loaded while the
+box still said 1 MHz was written on a 1 µs grid without a word.
+
 The reader is deliberately looser than the writer, because the files it gets
 pointed at were written by other things:
 

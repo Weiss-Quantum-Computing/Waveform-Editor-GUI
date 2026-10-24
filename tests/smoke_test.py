@@ -49,6 +49,7 @@ W.messagebox.showerror = lambda *a, **k: failures.append("showerror " + repr(a))
 W.messagebox.showinfo = lambda *a, **k: failures.append("showinfo " + repr(a))
 W.messagebox.askyesno = lambda *a, **k: True
 W.messagebox.askokcancel = lambda *a, **k: True
+W.messagebox.askyesnocancel = lambda *a, **k: True
 root.update()
 root.update_idletasks()
 
@@ -385,6 +386,72 @@ if "scope_capture" in app.library:
         failures.append("headed file picked the wrong column: %r" % (got[:3],))
 else:
     failures.append("headed file did not load")
+
+# --- a timed file keeps its own grid (WE-1) -------------------------------
+# An ILC drive on the 2 us grid loaded while the rate box says 1 MHz: an
+# ILC-header save must not quietly re-time it onto 1 us. The question is
+# answered Yes (own grid), No (the box), Cancel (nothing written).
+timed = os.path.join(folder, "drive_2us.csv")
+with open(timed, "w") as fh:
+    fh.write("# smoke drive\ntime_us,voltage_V\n")
+    for i in range(50):
+        fh.write("%.6f,%.6f\n" % (2.0 * i, i / 50.0))
+asked = []
+
+
+def _answer(value):
+    def ask(*a, **k):
+        asked.append(a)
+        return value
+    return ask
+
+
+def _save_timed(answer, rate_box, path):
+    W.messagebox.askyesnocancel = _answer(answer)
+    app.rate_text.set(rate_box)
+    app.write_one(path, "drive_2us")
+
+
+def _time_step(path):
+    columns, names = W.read_table(path)
+    return columns[0][1] - columns[0][0]
+
+
+step("load a timed file", lambda: (app.rate_text.set("1e6"), app.load_one(timed, ask=False)))
+check(abs(app.wave_rate.get("drive_2us", 0) - 500000.0) < 1e-3,
+      "timed file did not keep its 2 us grid: %r" % (app.wave_rate.get("drive_2us"),))
+step("ILC header on", lambda: app.ilc_header.set(True))
+own = os.path.join(folder, "timed_own.txt")
+step("save timed, own grid", lambda: _save_timed(True, "1e6", own))
+check(len(asked) == 1, "a rate mismatch did not ask (%d questions)" % (len(asked),))
+check(os.path.exists(own) and abs(_time_step(own) - 2.0) < 1e-9,
+      "Yes did not write the file on its own 2 us grid")
+boxed = os.path.join(folder, "timed_box.txt")
+step("save timed, box rate", lambda: _save_timed(False, "1e6", boxed))
+check(os.path.exists(boxed) and abs(_time_step(boxed) - 1.0) < 1e-9,
+      "No did not write the file at the rate box (1 us)")
+cancelled = os.path.join(folder, "timed_cancel.txt")
+step("save timed, cancel", lambda: _save_timed(None, "1e6", cancelled))
+check(not os.path.exists(cancelled), "Cancel still wrote the file")
+del asked[:]
+agreed = os.path.join(folder, "timed_agree.txt")
+step("save timed, box agrees", lambda: _save_timed(None, "500000", agreed))
+check(not asked and os.path.exists(agreed), "a matching rate box asked or refused")
+no_box = os.path.join(folder, "timed_nobox.txt")
+step("save timed, box empty", lambda: _save_timed(None, "", no_box))
+check(not asked and os.path.exists(no_box) and abs(_time_step(no_box) - 2.0) < 1e-9,
+      "with the box empty the file's own grid was not used")
+step("piece keeps the grid", lambda: (app.cut_source.set("drive_2us"),
+                                      app.cut_first.set("1"), app.cut_last.set("20"),
+                                      app.cut_name.set("drive_2us_piece"), app.do_take()))
+check(abs(app.wave_rate.get("drive_2us_piece", 0) - 500000.0) < 1e-3,
+      "a piece of a timed record lost its grid")
+step("ILC header off, tidy up", lambda: (app.ilc_header.set(False), app.rate_text.set(""),
+                                         setattr(W.messagebox, "askyesnocancel",
+                                                 lambda *a, **k: True)))
+for entry in ("timed_own.txt", "timed_box.txt", "timed_agree.txt", "timed_nobox.txt"):
+    if os.path.exists(os.path.join(folder, entry)):
+        os.remove(os.path.join(folder, entry))
 
 # --- supertime ramps ------------------------------------------------------
 # An ILC-style drive with a DC offset, through the whole tab: read, plateau

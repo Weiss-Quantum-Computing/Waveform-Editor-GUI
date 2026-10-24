@@ -1594,6 +1594,58 @@ def value_column(columns, names):
     return 1, True
 
 
+# Microseconds per unit of a time column, by its header name. A two-column
+# file with no header is taken to be in microseconds, as read_timed takes it:
+# that is the ILC drives' and the Supertime files' unit.
+_TIME_UNIT_US = {"time_us": 1.0, "t_us": 1.0, "us": 1.0, "usec": 1.0,
+                 "time": 1.0,
+                 "time_ms": 1e3, "t_ms": 1e3, "ms": 1e3, "msec": 1e3,
+                 "time_s": 1e6, "t_s": 1e6, "s": 1e6, "sec": 1e6,
+                 "secs": 1e6, "seconds": 1e6,
+                 "time_ns": 1e-3, "t_ns": 1e-3, "ns": 1e-3}
+
+
+def time_axis_rate(columns, names, index):
+    """The sample rate in Hz of the time column a load drops, or 0.0.
+
+    A load keeps only the value column. When the column it drops is a time
+    axis on a uniform grid, this is that grid as a rate, so the waveform can
+    carry its own step: an ILC-header save writes the time column from a
+    rate, and a 2 us drive saved at a 1 MHz box would play twice as fast.
+    A column of 1,2,3.. with no header is this program's own index, not time.
+    """
+    if len(columns) < 2:
+        return 0.0
+    tcol = 1 if index == 0 else 0
+    if names and len(names) == len(columns):
+        scale = _TIME_UNIT_US.get(names[tcol].strip().lstrip("#").strip().lower())
+        if scale is None:
+            return 0.0
+    elif len(columns) == 2 and not looks_like_index(columns[tcol]):
+        scale = 1.0
+    else:
+        return 0.0
+    t = columns[tcol]
+    n = len(t)
+    if n < 2:
+        return 0.0
+    step = (t[-1] - t[0]) / float(n - 1)
+    if not step > 0:
+        return 0.0
+    # Within a thousandth of a step of the grid everywhere: the files carry
+    # six decimals of microseconds, so a 3 MHz grid is not exact on disk.
+    slack = 1e-3 * step
+    for i in xrange(n):
+        if abs(t[i] - (t[0] + i * step)) > slack:
+            return 0.0
+    return 1e6 / (step * scale)
+
+
+def same_rate(a, b):
+    """Two sample rates that write the same time column."""
+    return abs(a - b) <= 1e-6 * max(abs(a), abs(b))
+
+
 def write_csv(path, samples):
     """The two columns that were asked for, and nothing else in the file.
 
@@ -2323,6 +2375,10 @@ class App(object):
         # for a comment, so provenance lives in the session and in the log.
         self.library = OrderedDict()
         self.origin = {}
+        # name -> the sample rate (Hz) the waveform itself is on, for the ones
+        # that know it: loaded with a time column, or built on a stated grid.
+        # An ILC-header save checks the rate box against it (review WE-1).
+        self.wave_rate = {}
         self.list_names = []
         # The names that are on disk as this program last left them. Without it
         # the close prompt cried wolf on every single exit, including the one
@@ -2500,16 +2556,22 @@ class App(object):
         self.refresh_preview()
 
     def add_wave(self, name, samples, origin, select=True, quiet=False,
-                 saved=False):
+                 saved=False, rate=0.0):
         """Put a waveform in the library under a name nothing else is using.
 
         `saved` says this one came off disk and is already there - which is
         true of a load and of nothing else, because everything the program
         makes itself exists only in the window until it is written out.
+        `rate` is the waveform's own sample rate when it has one (a time
+        column on load, a known grid), 0 when only the rate box knows.
         """
         final = unique_name(name, self.library)
         self.library[final] = list(samples)
         self.origin[final] = origin
+        if rate and rate > 0:
+            self.wave_rate[final] = rate
+        else:
+            self.wave_rate.pop(final, None)
         if saved:
             self.saved.add(final)
         else:
@@ -2654,7 +2716,16 @@ class App(object):
         origin = "loaded %s" % (os.path.basename(path),)
         if len(columns) > 1:
             origin += ", column %d" % (index + 1,)
-        return self.add_wave(stem, samples, origin, quiet=quiet, saved=True)
+        rate = time_axis_rate(columns, names, index)
+        if rate > 0:
+            origin += ", %.6g us grid" % (1e6 / rate,)
+        final = self.add_wave(stem, samples, origin, quiet=quiet, saved=True,
+                              rate=rate)
+        box = self.rate()
+        if rate > 0 and box > 0 and not same_rate(rate, box):
+            self.log("  %s is on a %.6g us grid (%.10g Sa/s); the rate box says "
+                     "%.10g Sa/s (%.6g us)" % (final, 1e6 / rate, rate, box, 1e6 / box))
+        return final
 
     def ask_column(self, columns, names, filename):
         """Which column holds the samples, when the file does not make it clear."""
@@ -2708,16 +2779,12 @@ class App(object):
         says: plain index,value, or time_us,voltage_V with a # header
         (needs the sample rate - refused with the reason, not guessed)."""
         ilc = bool(self.ilc_header.get())
-        rate = self.rate()
-        if ilc and rate <= 0:
-            self.log("Not saved: 'ILC header' is ticked but no sample rate is set.")
-            messagebox.showinfo(
-                "Sample rate needed",
-                "'ILC header' is ticked, so the file gets a time_us column, "
-                "and that needs the sample rate in the top bar (500kHz is "
-                "the 2 us grid the ILC targets and drives use). Set it, or "
-                "untick the box for the plain index,value file.")
-            return False
+        rate = 0.0
+        if ilc:
+            rates = self.ilc_rates([name])
+            if rates is None:
+                return False
+            rate = rates[name]
         try:
             if ilc:
                 write_time_csv(path, self.library[name], rate,
@@ -2740,6 +2807,60 @@ class App(object):
                      % (name, path, fmt_count(len(self.library[name]))))
         return True
 
+    def ilc_rates(self, names):
+        """name -> the rate an ILC-header save writes its time column at, or
+        None when it must not be saved.
+
+        A waveform that knows its own grid (WE-1) is checked against the rate
+        box: when they disagree the user picks one, because a 2 us drive
+        written at a 1 MHz box plays twice as fast in the ILC. With the box
+        empty a waveform's own rate is used; one with neither is refused, the
+        reason given, never guessed.
+        """
+        box = self.rate()
+        own = dict((n, self.wave_rate.get(n, 0.0)) for n in names)
+        missing = [n for n in names if own[n] <= 0 and box <= 0]
+        if missing:
+            self.log("Not saved: 'ILC header' is ticked but no sample rate is set "
+                     "(%s)." % (", ".join(missing[:6]),))
+            messagebox.showinfo(
+                "Sample rate needed",
+                "'ILC header' is ticked, so the file gets a time_us column, "
+                "and that needs the sample rate in the top bar (500kHz is "
+                "the 2 us grid the ILC targets and drives use). Set it, or "
+                "untick the box for the plain index,value file.")
+            return None
+        differ = [n for n in names if own[n] > 0 and box > 0
+                  and not same_rate(own[n], box)]
+        use_own = True
+        if differ:
+            shown = "\n".join(["  %s: %.6g us (%.10g Sa/s)" % (n, 1e6 / own[n], own[n])
+                               for n in differ[:6]])
+            if len(differ) > 6:
+                shown += "\n  ... and %d more" % (len(differ) - 6,)
+            answer = messagebox.askyesnocancel(
+                "Sample rate differs",
+                "The rate box says %.10g Sa/s (%.6g us), but %s on a "
+                "different grid of %s own:\n\n%s\n\n"
+                "Yes: write each on its own grid.\n"
+                "No: write at the rate box - the time axis changes, so it "
+                "plays at a different speed.\nCancel: save nothing."
+                % (box, 1e6 / box,
+                   "this waveform is" if len(differ) == 1 else
+                   "%d waveforms are" % (len(differ),),
+                   "its" if len(differ) == 1 else "their", shown))
+            if answer is None:
+                self.log("Not saved: the rate box and the waveform's own grid differ.")
+                return None
+            use_own = bool(answer)
+        rates = {}
+        for n in names:
+            if own[n] > 0 and (use_own or box <= 0):
+                rates[n] = own[n]
+            else:
+                rates[n] = box
+        return rates
+
     def do_save_all(self):
         if not self.library:
             messagebox.showinfo("Nothing to save", "The library is empty.")
@@ -2760,21 +2881,17 @@ class App(object):
                 return
         self.folder.set(os.path.normpath(folder))
         ilc = bool(self.ilc_header.get())
-        rate = self.rate()
-        if ilc and rate <= 0:
-            self.log("Not saved: 'ILC header' is ticked but no sample rate is set.")
-            messagebox.showinfo(
-                "Sample rate needed",
-                "'ILC header' is ticked, so every file gets a time_us column, "
-                "and that needs the sample rate in the top bar (500kHz is "
-                "the 2 us grid). Set it, or untick the box.")
-            return
+        rates = {}
+        if ilc:
+            rates = self.ilc_rates(list(self.library))
+            if rates is None:
+                return
         written = 0
         for name in self.library:
             path = os.path.join(folder, safe_name(name) + ".csv")
             try:
                 if ilc:
-                    write_time_csv(path, self.library[name], rate,
+                    write_time_csv(path, self.library[name], rates[name],
                                    comment="%s: %s" % (name, self.origin.get(name, name)))
                 else:
                     write_csv(path, self.library[name])
@@ -2807,6 +2924,8 @@ class App(object):
                 rebuilt[key] = self.library[key]
         self.library = rebuilt
         self.origin[final] = self.origin.pop(name, "")
+        if name in self.wave_rate:
+            self.wave_rate[final] = self.wave_rate.pop(name)
         # The file it was saved as still has the old name, so the renamed one
         # is not on disk under the name it now has.
         self.saved.discard(name)
@@ -2817,7 +2936,8 @@ class App(object):
         name = self.selected()
         if not name:
             return
-        self.add_wave(name, self.library[name], "copy of %s" % (name,))
+        self.add_wave(name, self.library[name], "copy of %s" % (name,),
+                      rate=self.wave_rate.get(name, 0.0))
 
     def do_remove(self):
         name = self.selected()
@@ -2825,6 +2945,7 @@ class App(object):
             return
         del self.library[name]
         self.origin.pop(name, None)
+        self.wave_rate.pop(name, None)
         self.saved.discard(name)
         self.refresh_library()
         self.log("Removed %s from the library (no file was touched)" % (name,))
@@ -2840,6 +2961,7 @@ class App(object):
             return
         self.library = OrderedDict()
         self.origin = {}
+        self.wave_rate = {}
         self.saved = set()
         self.refresh_library()
         self.log("Library emptied.")
@@ -3361,7 +3483,8 @@ class App(object):
             return
         target = self.cut_name.get().strip() or ("%s_piece" % (name,))
         self.add_wave(target, data, "%s[%s..%s]"
-                      % (name, fmt_count(first), fmt_count(last)))
+                      % (name, fmt_count(first), fmt_count(last)),
+                      rate=self.wave_rate.get(name, 0.0))
         self.cut_name.set("")
 
     def do_split_equal(self):
@@ -3410,7 +3533,8 @@ class App(object):
             self.add_wave("%s_%d" % (name, number), piece,
                           "%s[%s..%s]" % (name, fmt_count(start),
                                           fmt_count(start + len(piece) - 1)),
-                          select=(number == len(pieces)), quiet=True)
+                          select=(number == len(pieces)), quiet=True,
+                          rate=self.wave_rate.get(name, 0.0))
             start += len(piece)
         self.log("Split %s into %d piece(s) of %s"
                  % (name, len(pieces),
@@ -3707,7 +3831,11 @@ class App(object):
             messagebox.showerror("Cannot do that", str(exc))
             return
         self.mod_note.configure(text="", foreground=NOTE_GREY)
+        rate = (self.wave_rate.get(name, 0.0)
+                if len(data) == len(self.library[name]) else 0.0)
         if self.mod_replace.get():
+            if not rate:
+                self.wave_rate.pop(name, None)
             self.library[name] = data
             self.origin[name] = "%s, %s" % (self.origin.get(name, name), note)
             self.saved.discard(name)
@@ -3715,7 +3843,7 @@ class App(object):
             self.log("%s: %s (%s, in place)" % (name, describe(data), note))
         else:
             target = self.mod_name.get().strip() or ("%s_%s" % (name, suffix))
-            self.add_wave(target, data, "%s of %s" % (note, name))
+            self.add_wave(target, data, "%s of %s" % (note, name), rate=rate)
             self.mod_name.set("")
 
     def do_scale(self):
@@ -4023,7 +4151,8 @@ class App(object):
         stem = safe_name(self.st_stem.get().strip() or "ramp")
         for label, anchor, tt, vv, offset in halves:
             self.add_wave("%s_%s" % (stem, label), vv,
-                          "Supertime %s half, %g us grid, offset %.5g" % (label, tt[1] - tt[0], offset))
+                          "Supertime %s half, %g us grid, offset %.5g" % (label, tt[1] - tt[0], offset),
+                          rate=1e6 / (tt[1] - tt[0]))
 
     def st_parse_point(self, rows, text, what):
         """One ramp endpoint as (log units, card volts); '9.16V' means volts."""
@@ -4235,7 +4364,8 @@ class App(object):
         for key, label in (("a", "outer"), ("b", "inner")):
             t, v = data[key]
             name = os.path.splitext(os.path.basename(self.cfg["se_file_" + key]))[0]
-            self.add_wave(name, v, "series %s drive, %g us grid" % (label, t[1] - t[0]))
+            self.add_wave(name, v, "series %s drive, %g us grid" % (label, t[1] - t[0]),
+                          rate=1e6 / (t[1] - t[0]))
 
     def se_write(self):
         """All four Supertime files, each drive split at the middle of its own
@@ -4291,9 +4421,11 @@ class App(object):
         self.add_wave("series_outer_target", outer,
                       "nested target: lead %g, rise %g, guard %g, inner %g+%g+%g, tail %g us"
                       % (num["lead"], num["orise"], num["guard"], num["irise"],
-                         num["ihold"], num["irise"], num["tail"]), select=False)
+                         num["ihold"], num["irise"], num["tail"]), select=False,
+                      rate=rate)
         self.add_wave("series_inner_target", inner,
-                      "nested target inside series_outer_target", select=False)
+                      "nested target inside series_outer_target", select=False,
+                      rate=rate)
         lines, ok, angle, marks = series_pair(t, outer, t, inner, num["guard"] * 0.99)
         self.se_say(["built series_outer_target and series_inner_target: %s points, "
                      "%g us grid, %g us long, ILC header ticked for Save CSV"
@@ -4461,8 +4593,26 @@ def selftest():
             failures.append("time csv without a rate should have been refused")
         except ValueError:
             pass
+        # WE-1: the time column a load drops gives the waveform its own rate.
+        close("time csv own rate", time_axis_rate(columns, names, 1), 500000.0)
     finally:
         os.remove(path)
+
+    # The dropped column's unit comes from its name; no header is microseconds;
+    # this program's own 1,2,3.. index and a ragged axis are not a time grid.
+    columns, names = table_from_lines(["time_s,CH1_V,CH2_V", "0,1,2",
+                                       "1e-6,1,2", "2e-6,1,2"])
+    close("rate from time_s", time_axis_rate(columns, names, 1), 1e6)
+    columns, names = table_from_lines(["0,0.5", "2,0.25", "4,0.125"])
+    close("rate, no header", time_axis_rate(columns, names, 1), 500000.0)
+    columns, names = table_from_lines(["1,0.5", "2,0.25", "3,0.125"])
+    check("index is no rate", time_axis_rate(columns, names, 1), 0.0)
+    columns, names = table_from_lines(["0,0.5", "2,0.25", "5,0.125"])
+    check("ragged is no rate", time_axis_rate(columns, names, 1), 0.0)
+    columns, names = table_from_lines(["idx,volts", "0,0.5", "2,0.25"])
+    check("unknown name no rate", time_axis_rate(columns, names, 1), 0.0)
+    check("same rate", (same_rate(500000.0, 500000.0000001),
+                        same_rate(500000.0, 1e6)), (True, False))
 
     # The tolerant reader: one column, other delimiters, comments, a header.
     columns, names = table_from_lines(["# a comment", "1;0.5", "2;0.25"])
