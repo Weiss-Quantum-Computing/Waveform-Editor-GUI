@@ -13,6 +13,7 @@ there to catch the common ones by eye.
 """
 import io
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,18 +64,20 @@ problems += len(errors)
 
 # Names that parse under 2.7 but only exist on 3. Reported rather than failed:
 # every one of them here is inside a try/except or a version shim, and the
-# point is to notice a new one arriving.
+# point is to notice a new one arriving. Regexes, word-bounded: the f-string
+# probe was the substring f", which every string ending in "of" matched.
 print()
-for label, needle in (("nonlocal", "nonlocal "),
-                      ("yield from", "yield from"),
-                      ("f-string", 'f"'),
-                      ("tkinter (lowercase)", "import tkinter"),
-                      ("trace_add", "trace_add"),
-                      ("exist_ok", "exist_ok"),
-                      ("subprocess.run", "subprocess.run"),
-                      ("math.inf", "math.inf"),
-                      ("format_map", "format_map")):
-    hits = [i + 1 for i, line in enumerate(text.splitlines()) if needle in line]
+for label, needle in (("nonlocal", r"\bnonlocal\s"),
+                      ("yield from", r"\byield\s+from\b"),
+                      ("f-string", r"(?<![\w'\"])(?:[fF][rR]?|[rR][fF])['\"]"),
+                      ("tkinter (lowercase)", r"\bimport\s+tkinter\b"),
+                      ("trace_add", r"\btrace_add\b"),
+                      ("exist_ok", r"\bexist_ok\b"),
+                      ("subprocess.run", r"\bsubprocess\.run\b"),
+                      ("math.inf", r"\bmath\.inf\b"),
+                      ("format_map", r"\bformat_map\b")):
+    probe = re.compile(needle)
+    hits = [i + 1 for i, line in enumerate(text.splitlines()) if probe.search(line)]
     if hits:
         print("3-only name %-22s lines %s" % (label + ":", hits[:8]))
 
