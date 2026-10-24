@@ -60,6 +60,11 @@ pointed at were written by other things:
 - `#` comment lines — so the AWG GUI's own `Waveforms/*.csv` cache files, which
   carry two comment lines and a single column, load here directly.
 
+It is not looser about the numbers themselves: `nan`, `inf` and `-inf` (which
+Python's float() reads) stop the read with the line they are on, the boxes
+treat them as unreadable, and both writers refuse a record that holds one -
+the AWG panels would upload such a file as a zero record.
+
 Which column holds the samples is worked out rather than assumed. The
 `index,value` pair this program writes is recognised outright, so reloading its
 own output never asks anything; `time_us,voltage_V` picks the volts, not the

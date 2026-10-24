@@ -453,6 +453,14 @@ for entry in ("timed_own.txt", "timed_box.txt", "timed_agree.txt", "timed_nobox.
     if os.path.exists(os.path.join(folder, entry)):
         os.remove(os.path.join(folder, entry))
 
+# --- nan / inf in a file are refused, not loaded as samples (WE-4) ---------
+nan_file = os.path.join(folder, "has_nan.txt")
+with open(nan_file, "w") as fh:
+    fh.write("1,0.5\n2,nan\n3,0.25\n")
+step("load a file with nan", lambda: app.load_one(nan_file, ask=False, quiet=True))
+check("has_nan" not in app.library, "a file with nan in it was loaded")
+os.remove(nan_file)
+
 # --- Save all refuses two names that are one file (WE-3) --------------------
 # On Windows `Ramp` and `ramp` are the same file: the second must not silently
 # replace the first with both flagged saved.

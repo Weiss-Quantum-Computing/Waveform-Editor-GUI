@@ -593,11 +593,37 @@ def fmt_secs(value):
     return "%.4g ps" % (value * 1e12,)
 
 
+def is_finite(value):
+    """Not nan, not +-inf. (math.isfinite is Python 3 only.)"""
+    return not (math.isnan(value) or math.isinf(value))
+
+
 def as_float(text, default=0.0):
+    """A number from a box, or `default`. float() takes 'nan' and 'inf';
+    those are not numbers anything here can use, so they are refused like
+    any other unreadable text (review WE-4)."""
     try:
-        return float(as_text(text).strip())
+        value = float(as_text(text).strip())
     except (TypeError, ValueError):
         return default
+    return value if is_finite(value) else default
+
+
+def first_non_finite(samples):
+    """(1-based sample number, value) of the first nan/inf, or None."""
+    for number, value in enumerate(samples, 1):
+        if not is_finite(value):
+            return number, value
+    return None
+
+
+def refuse_non_finite(samples, what):
+    """Raise before a file is opened: nan written to a CSV goes on to the
+    4063B / DS345 panels, which upload it as a zero record."""
+    bad = first_non_finite(samples)
+    if bad:
+        raise ValueError("%s has %r at sample %d - not written"
+                         % (what, bad[1], bad[0]))
 
 
 def as_bool(text, default=False):
@@ -1515,6 +1541,13 @@ def table_from_lines(lines, source="the data"):
                 continue
             raise ValueError("cannot read line %d of %s as numbers: %s"
                              % (number, source, line[:60]))
+        # float() reads 'nan', 'inf' and '-inf' too. Nothing downstream can
+        # use them, and a file carrying them is uploaded by the AWG panels as
+        # a zero record, so they stop the read here with the line (WE-4).
+        for value in values:
+            if not is_finite(value):
+                raise ValueError("line %d of %s has %r, which is not a finite "
+                                 "number: %s" % (number, source, value, line[:60]))
         if columns is None:
             columns = [[] for _ in values]
         if len(values) != len(columns):
@@ -1654,6 +1687,7 @@ def write_csv(path, samples):
     GUI's cache uses, since a 16-bit DAC cannot tell the difference - loses
     digits that a chain of cuts and rescales here would notice.
     """
+    refuse_non_finite(samples, os.path.basename(path))
     handle = open(path, "w")
     try:
         # Built in blocks rather than a write per sample: on XP over a network
@@ -1686,6 +1720,7 @@ def write_time_csv(path, samples, rate, comment=None):
         raise ValueError("set the sample rate in the top bar first - the "
                          "time column needs it (500kHz for the 2 us grid)")
     step_us = 1e6 / rate
+    refuse_non_finite(samples, os.path.basename(path))
     handle = open(path, "w")
     try:
         if comment:
@@ -4650,6 +4685,31 @@ def selftest():
     check("header column", value_column(columns, names), (1, False))
     columns, names = table_from_lines(["# AWG cache", "0.5", "0.25", "0.125"])
     check("one column", value_column(columns, names), (0, False))
+    # WE-4: nan / inf stop the read at their line, and the writers and the
+    # boxes refuse them too.
+    for bad in ("nan", "inf", "-inf", "NaN", "Infinity"):
+        try:
+            table_from_lines(["1,0.5", "2,%s" % (bad,), "3,0.25"], "t.csv")
+            failures.append("%s was read as a sample" % (bad,))
+        except ValueError as exc:
+            if "line 2 of t.csv" not in str(exc):
+                failures.append("%s refused without its line: %s" % (bad, exc))
+    check("box nan", as_float("nan", 7.0), 7.0)
+    check("box inf", as_float("-inf", None), None)
+    check("box number", as_float("2.5", None), 2.5)
+    handle, path = tempfile.mkstemp(suffix=".csv")
+    os.close(handle)
+    os.remove(path)
+    for writer in (lambda: write_csv(path, [0.0, float("nan")]),
+                   lambda: write_time_csv(path, [float("inf"), 0.0], 1e6)):
+        try:
+            writer()
+            failures.append("a non-finite sample was written")
+        except ValueError:
+            pass
+        if os.path.exists(path):
+            failures.append("a refused write still left a file")
+            os.remove(path)
 
     check("unique name", unique_name("a", {"a": 1, "a_2": 1}), "a_3")
     # WE-3: names Save all would write to one file.
